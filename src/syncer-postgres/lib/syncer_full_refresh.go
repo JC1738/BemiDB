@@ -32,7 +32,11 @@ func (syncer *SyncerFullRefresh) Sync(postgres *Postgres, pgSchemaTables []PgSch
 		icebergTableNames.Add(pgSchemaTable.IcebergTableName())
 	}
 
-	syncer.Utils.DeleteOldTables(icebergTableNames)
+	// NOTE: DeleteOldTables() has been removed to support independent table syncing.
+	// This allows running multiple syncer instances with different SOURCE_POSTGRES_INCLUDE_TABLES
+	// on different schedules without deleting tables from previous syncs.
+	// To clean up old/renamed tables, manually drop them: DROP TABLE schema.table_name
+	// syncer.Utils.DeleteOldTables(icebergTableNames)
 }
 
 func (syncer *SyncerFullRefresh) syncTable(postgres *Postgres, pgSchemaTable PgSchemaTable, pgSchemaColumns []PgSchemaColumn) {
