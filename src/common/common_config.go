@@ -14,8 +14,27 @@ const (
 	ENV_AWS_ACCESS_KEY_ID     = "AWS_ACCESS_KEY_ID"
 	ENV_AWS_SECRET_ACCESS_KEY = "AWS_SECRET_ACCESS_KEY"
 
-	DEFAULT_LOG_LEVEL       = "INFO"
-	DEFAULT_AWS_S3_ENDPOINT = "s3.amazonaws.com"
+	// DuckLake environment variables
+	ENV_DUCKLAKE_CATALOG_URL  = "DUCKLAKE_CATALOG_URL"
+	ENV_DUCKLAKE_CATALOG_NAME = "DUCKLAKE_CATALOG_NAME"
+	ENV_DUCKLAKE_DATA_PATH    = "DUCKLAKE_DATA_PATH"
+
+	// R2 environment variables
+	ENV_R2_ACCOUNT_ID        = "R2_ACCOUNT_ID"
+	ENV_R2_ACCESS_KEY_ID     = "R2_ACCESS_KEY_ID"
+	ENV_R2_SECRET_ACCESS_KEY = "R2_SECRET_ACCESS_KEY"
+
+	// Performance and resource configuration
+	ENV_MEMORY_LIMIT      = "BEMIDB_MEMORY_LIMIT"
+	ENV_TEMP_DIRECTORY    = "BEMIDB_TEMP_DIRECTORY"
+	ENV_QUERY_TIMEOUT     = "BEMIDB_QUERY_TIMEOUT"
+	ENV_THREADS           = "BEMIDB_THREADS"
+
+	DEFAULT_LOG_LEVEL             = "INFO"
+	DEFAULT_AWS_S3_ENDPOINT       = "s3.amazonaws.com"
+	DEFAULT_DUCKLAKE_CATALOG_NAME = "ducklake"
+	DEFAULT_MEMORY_LIMIT          = "3GB"
+	DEFAULT_QUERY_TIMEOUT         = 300 // 5 minutes in seconds
 )
 
 type AwsConfig struct {
@@ -26,9 +45,28 @@ type AwsConfig struct {
 	SecretAccessKey string
 }
 
+type DucklakeConfig struct {
+	CatalogUrl  string
+	CatalogName string
+	DataPath    string
+}
+
+type R2Config struct {
+	AccountId       string
+	AccessKeyId     string
+	SecretAccessKey string
+}
+
 type CommonConfig struct {
-	Aws                       AwsConfig
+	Aws                       AwsConfig      // DEPRECATED: Not used with DuckLake
+	Ducklake                  DucklakeConfig
+	R2                        R2Config
 	LogLevel                  string
-	CatalogDatabaseUrl        string
+	CatalogDatabaseUrl        string // DEPRECATED: Not used with DuckLake
 	DisableAnonymousAnalytics bool
+	// Performance and resource configuration
+	MemoryLimit      string // DuckDB memory limit (e.g., '3GB', '8GB')
+	TempDirectory    string // DuckDB temp directory for spill-to-disk
+	QueryTimeout     int    // Query timeout in seconds
+	Threads          int    // Number of DuckDB threads (0 = auto-detect)
 }

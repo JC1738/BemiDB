@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -46,13 +47,21 @@ func (remapper *QueryRemapperTable) RemapTable(node *pgQuery.Node, permissions *
 	if remapper.isTableFromPgCatalog(qSchemaTable) {
 		switch qSchemaTable.Table {
 
-		// pg_class -> reload Iceberg tables
+		// pg_class -> reload Iceberg/DuckLake tables
 		case PG_TABLE_PG_CLASS:
-			remapper.reloadIcebergTables()
+			if remapper.config.CommonConfig.Ducklake.CatalogUrl != "" {
+				remapper.reloadDucklakeTables()
+			} else {
+				remapper.reloadIcebergTables()
+			}
 
-		// pg_stat_user_tables -> return Iceberg tables
+		// pg_stat_user_tables -> return Iceberg/DuckLake tables
 		case PG_TABLE_PG_STAT_USER_TABLES:
-			remapper.reloadIcebergTables()
+			if remapper.config.CommonConfig.Ducklake.CatalogUrl != "" {
+				remapper.reloadDucklakeTables()
+			} else {
+				remapper.reloadIcebergTables()
+			}
 			remapper.upsertPgStatUserTables()
 
 		// pg_matviews -> reload Iceberg materialized views
@@ -77,36 +86,69 @@ func (remapper *QueryRemapperTable) RemapTable(node *pgQuery.Node, permissions *
 		// information_schema.tables -> (SELECT * FROM main.tables) information_schema_tables
 		// information_schema.tables -> (SELECT * FROM main.tables WHERE table_schema || '.' || table_name IN ('permitted.table')) information_schema_tables
 		case PG_TABLE_TABLES:
-			remapper.reloadIcebergTables()
-			return parser.MakeInformationSchemaTablesNode(qSchemaTable, permissions)
+			if remapper.config.CommonConfig.Ducklake.CatalogUrl != "" {
+				remapper.reloadDucklakeTables()
+			} else {
+				remapper.reloadIcebergTables()
+			}
+			return parser.MakeInformationSchemaTablesNode(qSchemaTable, permissions, remapper.config.CommonConfig.Ducklake.CatalogUrl != "")
 
 		// information_schema.columns -> (SELECT * FROM main.columns) information_schema_columns
 		// information_schema.columns -> (SELECT * FROM main.columns WHERE (table_schema || '.' || table_name IN ('permitted.table') AND column_name IN ('permitted', 'columns')) OR ...) information_schema_columns
 		case PG_TABLE_COLUMNS:
-			return parser.MakeInformationSchemaColumnsNode(qSchemaTable, permissions)
+			return parser.MakeInformationSchemaColumnsNode(qSchemaTable, permissions, remapper.config.CommonConfig.Ducklake.CatalogUrl != "")
+
+		// information_schema.table_constraints -> (SELECT * FROM main.table_constraints) information_schema_table_constraints
+		case PG_TABLE_TABLE_CONSTRAINTS:
+			return parser.MakeInformationSchemaTableConstraintsNode(qSchemaTable, permissions, remapper.config.CommonConfig.Ducklake.CatalogUrl != "")
+
+		// information_schema.key_column_usage -> (SELECT * FROM main.key_column_usage) information_schema_key_column_usage
+		case PG_TABLE_KEY_COLUMN_USAGE:
+			return parser.MakeInformationSchemaKeyColumnUsageNode(qSchemaTable, permissions, remapper.config.CommonConfig.Ducklake.CatalogUrl != "")
 		}
 
 		// information_schema.* other system tables -> return as is
 		return node
 	}
 
-	// public.table -> (SELECT * FROM iceberg_scan('path')) table
-	// schema.table -> (SELECT * FROM iceberg_scan('path')) schema_table
-	// public.table -> (SELECT permitted, columns FROM iceberg_scan('path')) table
-	// public.table -> (SELECT NULL WHERE FALSE) table
+	// public.table -> catalog_name.schema.table
+	// schema.table -> catalog_name.schema.table
 	schemaTable := qSchemaTable.ToIcebergSchemaTable()
-	if !remapper.IcebergPersistentSchemaTables.Contains(schemaTable) && !remapper.IcebergMaterlizedSchemaTables.Contains(schemaTable) { // Reload Iceberg tables if not found
+
+	// For DuckLake: map "public" schema to "main" schema
+	if remapper.config.CommonConfig.Ducklake.CatalogUrl != "" && schemaTable.Schema == PG_SCHEMA_PUBLIC {
+		schemaTable.Schema = DUCKDB_SCHEMA_MAIN
+	}
+
+	// Check if table exists in DuckLake catalog
+	if !remapper.IcebergPersistentSchemaTables.Contains(schemaTable) && !remapper.IcebergMaterlizedSchemaTables.Contains(schemaTable) {
 		remapper.reloadIcebergTables()
 		if !remapper.IcebergPersistentSchemaTables.Contains(schemaTable) && !remapper.IcebergMaterlizedSchemaTables.Contains(schemaTable) {
 			return node // Let it return "Catalog Error: Table with name _ does not exist!"
 		}
 	}
-	icebergPath := remapper.icebergReader.MetadataFileS3Path(schemaTable) // iceberg/schema/table/metadata/v1.metadata.json
 
-	return parser.MakeIcebergTableNode(QueryToIcebergTable{
-		QuerySchemaTable: qSchemaTable,
-		IcebergTablePath: icebergPath,
-	}, permissions)
+	// Use DuckLake if configured, otherwise use legacy Iceberg
+	if remapper.config.CommonConfig.Ducklake.CatalogUrl != "" {
+		// Return DuckLake table reference
+		// Format: catalog_name.schema.table
+		ducklakeCatalogName := remapper.config.CommonConfig.Ducklake.CatalogName
+		ducklakeTablePath := fmt.Sprintf("%s.%s.%s", ducklakeCatalogName, schemaTable.Schema, schemaTable.Table)
+
+		common.LogDebug(remapper.config.CommonConfig, fmt.Sprintf("RemapTable: qSchemaTable=%v, schemaTable=%v, ducklakeTablePath=%s", qSchemaTable, schemaTable, ducklakeTablePath))
+
+		return parser.MakeDucklakeTableNode(QueryToIcebergTable{
+			QuerySchemaTable:     qSchemaTable,
+			IcebergTablePath:     ducklakeTablePath, // Reusing field name for compatibility
+		}, permissions)
+	} else {
+		// Legacy Iceberg path
+		icebergPath := remapper.icebergReader.MetadataFileS3Path(schemaTable)
+		return parser.MakeIcebergTableNode(QueryToIcebergTable{
+			QuerySchemaTable: qSchemaTable,
+			IcebergTablePath: icebergPath,
+		}, permissions)
+	}
 }
 
 // FROM FUNCTION()
@@ -139,6 +181,13 @@ func (remapper *QueryRemapperTable) reloadIcebergTables() {
 }
 
 func (remapper *QueryRemapperTable) reloadIcebergPersistentTables() {
+	// Use DuckLake if configured
+	if remapper.config.CommonConfig.Ducklake.CatalogUrl != "" {
+		remapper.reloadDucklakeTables()
+		return
+	}
+
+	// Legacy Iceberg implementation
 	newIcebergSchemaTables, err := remapper.icebergReader.SchemaTables()
 	common.PanicIfError(remapper.config.CommonConfig, err)
 
@@ -175,6 +224,48 @@ func (remapper *QueryRemapperTable) reloadIcebergPersistentTables() {
 			common.PanicIfError(remapper.config.CommonConfig, err)
 		}
 	}
+}
+
+func (remapper *QueryRemapperTable) reloadDucklakeTables() {
+	ctx := context.Background()
+
+	// Query DuckLake catalog for available tables using duckdb_tables() function
+	catalogName := remapper.config.CommonConfig.Ducklake.CatalogName
+
+	query := fmt.Sprintf(`
+		SELECT 'main' AS table_schema, t.table_name
+		FROM duckdb_databases() d
+		JOIN duckdb_tables() t ON d.database_oid = t.database_oid
+		WHERE d.database_name = '%s'
+		  AND t.table_name NOT LIKE 'ducklake_%%'
+	`, catalogName)
+
+	rows, err := remapper.ServerDuckdbClient.QueryContext(ctx, query)
+	common.PanicIfError(remapper.config.CommonConfig, err)
+	defer rows.Close()
+
+	newIcebergSchemaTables := common.NewSet[common.IcebergSchemaTable]()
+
+	for rows.Next() {
+		var schemaName, tableName string
+		err := rows.Scan(&schemaName, &tableName)
+		common.PanicIfError(remapper.config.CommonConfig, err)
+
+		schemaTable := common.IcebergSchemaTable{
+			Schema: schemaName,
+			Table:  tableName,
+		}
+		newIcebergSchemaTables.Add(schemaTable)
+
+		// Log new tables discovered
+		if !remapper.IcebergPersistentSchemaTables.Contains(schemaTable) {
+			common.LogInfo(remapper.config.CommonConfig, fmt.Sprintf("DuckLake: Discovered table %s.%s", schemaName, tableName))
+		}
+	}
+
+	remapper.IcebergPersistentSchemaTables = newIcebergSchemaTables
+
+	common.LogInfo(remapper.config.CommonConfig, fmt.Sprintf("DuckLake: Loaded %d tables from catalog", len(newIcebergSchemaTables)))
 }
 
 func (remapper *QueryRemapperTable) reloadIcebergMaterializedViews() {
@@ -220,7 +311,12 @@ func (remapper *QueryRemapperTable) upsertPgStatUserTables() {
 	if len(icebergSchemaTables) > 0 {
 		values := make([]string, len(icebergSchemaTables))
 		for i, icebergSchemaTable := range icebergSchemaTables {
-			values[i] = "('123456', '" + icebergSchemaTable.Schema + "', '" + icebergSchemaTable.Table + "', 0, NULL, 0, 0, NULL, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0)"
+			// For DuckLake, map 'main' schema to 'public' for Postgres compatibility
+			schema := icebergSchemaTable.Schema
+			if remapper.config.CommonConfig.Ducklake.CatalogUrl != "" && schema == DUCKDB_SCHEMA_MAIN {
+				schema = PG_SCHEMA_PUBLIC
+			}
+			values[i] = "('123456', '" + schema + "', '" + icebergSchemaTable.Table + "', 0, NULL, 0, 0, NULL, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0)"
 		}
 		sqls = append(sqls, "INSERT INTO pg_stat_user_tables VALUES "+strings.Join(values, ", "))
 	}
@@ -272,6 +368,44 @@ func extractTableNames(tables []string) common.Set[string] {
 	return names
 }
 
+// getDuckDBTypeToPostgresOidCaseExpression returns a SQL CASE expression that maps
+// DuckDB data_type strings to Postgres type OIDs
+func getDuckDBTypeToPostgresOidCaseExpression(dataTypeColumn string) string {
+	return `CASE
+		WHEN ` + dataTypeColumn + ` = 'BOOLEAN' THEN 16
+		WHEN ` + dataTypeColumn + ` = 'TINYINT' THEN 21
+		WHEN ` + dataTypeColumn + ` = 'SMALLINT' THEN 21
+		WHEN ` + dataTypeColumn + ` = 'INTEGER' THEN 23
+		WHEN ` + dataTypeColumn + ` = 'BIGINT' THEN 20
+		WHEN ` + dataTypeColumn + ` = 'UTINYINT' THEN 21
+		WHEN ` + dataTypeColumn + ` = 'USMALLINT' THEN 23
+		WHEN ` + dataTypeColumn + ` = 'UINTEGER' THEN 20
+		WHEN ` + dataTypeColumn + ` = 'UBIGINT' THEN 20
+		WHEN ` + dataTypeColumn + ` = 'FLOAT' THEN 700
+		WHEN ` + dataTypeColumn + ` = 'DOUBLE' THEN 701
+		WHEN ` + dataTypeColumn + ` = 'DECIMAL' THEN 1700
+		WHEN ` + dataTypeColumn + ` = 'VARCHAR' THEN 1043
+		WHEN ` + dataTypeColumn + ` LIKE 'VARCHAR%' THEN 1043
+		WHEN ` + dataTypeColumn + ` = 'TEXT' THEN 25
+		WHEN ` + dataTypeColumn + ` = 'DATE' THEN 1082
+		WHEN ` + dataTypeColumn + ` = 'TIMESTAMP' THEN 1114
+		WHEN ` + dataTypeColumn + ` = 'TIMESTAMP WITH TIME ZONE' THEN 1184
+		WHEN ` + dataTypeColumn + ` = 'TIME' THEN 1083
+		WHEN ` + dataTypeColumn + ` = 'TIME WITH TIME ZONE' THEN 1266
+		WHEN ` + dataTypeColumn + ` = 'INTERVAL' THEN 1186
+		WHEN ` + dataTypeColumn + ` = 'JSON' THEN 114
+		WHEN ` + dataTypeColumn + ` = 'JSONB' THEN 3802
+		WHEN ` + dataTypeColumn + ` = 'UUID' THEN 2950
+		WHEN ` + dataTypeColumn + ` = 'BLOB' THEN 17
+		WHEN ` + dataTypeColumn + ` = 'BYTEA' THEN 17
+		WHEN ` + dataTypeColumn + ` LIKE '%[]' THEN 2277
+		WHEN ` + dataTypeColumn + ` LIKE 'MAP(%' THEN 114
+		WHEN ` + dataTypeColumn + ` LIKE 'STRUCT(%' THEN 2249
+		WHEN ` + dataTypeColumn + ` = '"NULL"' THEN 25
+		ELSE 25
+	END`
+}
+
 func CreatePgCatalogTableQueries(config *Config) []string {
 	result := []string{
 		// Static empty tables
@@ -306,41 +440,97 @@ func CreatePgCatalogTableQueries(config *Config) []string {
 		"CREATE VIEW user AS SELECT '" + config.User + "' AS user",
 
 		// Dynamic views
-		// DuckDB does not support indnullsnotdistinct column
-		"CREATE VIEW pg_index AS SELECT *, FALSE AS indnullsnotdistinct FROM pg_catalog.pg_index",
+		// Note: pg_index view is created later for DuckLake integration with primary key support
 		// Hide DuckDB's system and duplicate schemas
 		"CREATE VIEW pg_namespace AS SELECT * FROM pg_catalog.pg_namespace WHERE oid >= (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = '" + PG_SCHEMA_PUBLIC + "')",
 		// DuckDB does not support relforcerowsecurity column
-		`CREATE VIEW pg_class AS SELECT
-			oid,
-			relname,
-			relnamespace,
-			reltype,
-			reloftype,
-			relowner,
-			relam,
-			relfilenode,
-			reltablespace,
-			relpages,
-			reltuples,
-			relallvisible,
-			reltoastrelid,
-			relhasindex,
-			relisshared,
-			relpersistence,
-			CASE relkind
+		`CREATE VIEW pg_class AS
+		SELECT
+			c.oid,
+			c.relname,
+			c.relnamespace,
+			c.reltype,
+			c.reloftype,
+			c.relowner,
+			c.relam,
+			c.relfilenode,
+			c.reltablespace,
+			c.relpages,
+			c.reltuples,
+			c.relallvisible,
+			c.reltoastrelid,
+			c.relhasindex,
+			c.relisshared,
+			c.relpersistence,
+			CASE c.relkind
 				WHEN 'v' THEN
-					CASE relnamespace >= (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = '` + PG_SCHEMA_PUBLIC + `')
+					CASE c.relnamespace >= (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = '` + PG_SCHEMA_PUBLIC + `')
 					WHEN TRUE THEN
 						'm'
 					ELSE
 						'v'
 					END
 			ELSE
-				relkind
+				c.relkind
 			END AS relkind,
 			FALSE AS relforcerowsecurity
-		FROM pg_catalog.pg_class`,
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+		WHERE n.nspname IN ('pg_catalog', 'information_schema')
+		UNION ALL
+		SELECT
+			(hash(t.table_name) % 2147483647)::BIGINT AS oid,
+			t.table_name AS relname,
+			(SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'public') AS relnamespace,
+			0 AS reltype,
+			0 AS reloftype,
+			0 AS relowner,
+			0 AS relam,
+			0 AS relfilenode,
+			0 AS reltablespace,
+			0 AS relpages,
+			0 AS reltuples,
+			0 AS relallvisible,
+			0 AS reltoastrelid,
+			FALSE AS relhasindex,
+			FALSE AS relisshared,
+			'p' AS relpersistence,
+			'r' AS relkind,
+			FALSE AS relforcerowsecurity
+		FROM duckdb_databases() d
+		JOIN duckdb_tables() t ON d.database_oid = t.database_oid
+		WHERE d.database_name = '` + config.CommonConfig.Ducklake.CatalogName + `'
+		  AND t.table_name NOT LIKE 'ducklake_%%'
+		UNION ALL
+		SELECT
+			(hash(t.table_name || '_pkey') % 2147483647)::BIGINT AS oid,
+			t.table_name || '_pkey' AS relname,
+			(SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'public') AS relnamespace,
+			0 AS reltype,
+			0 AS reloftype,
+			0 AS relowner,
+			403 AS relam,
+			0 AS relfilenode,
+			0 AS reltablespace,
+			0 AS relpages,
+			0 AS reltuples,
+			0 AS relallvisible,
+			0 AS reltoastrelid,
+			FALSE AS relhasindex,
+			FALSE AS relisshared,
+			'p' AS relpersistence,
+			'i' AS relkind,
+			FALSE AS relforcerowsecurity
+		FROM duckdb_databases() d
+		JOIN duckdb_tables() t ON d.database_oid = t.database_oid
+		WHERE d.database_name = '` + config.CommonConfig.Ducklake.CatalogName + `'
+		  AND t.table_name NOT LIKE 'ducklake_%%'
+		  AND EXISTS (
+		      SELECT 1 FROM duckdb_columns() c
+		      WHERE c.table_oid = t.table_oid
+		      AND c.column_name = 'id'
+		      AND NOT c.internal
+		  )`,
 		`CREATE VIEW pg_type AS
 			SELECT * FROM pg_catalog.pg_type
 			UNION ALL
@@ -707,11 +897,255 @@ func CreatePgCatalogTableQueries(config *Config) []string {
 			SELECT 6157, '_int8multirange', (SELECT typnamespace FROM pg_catalog.pg_type WHERE typname = 'bool'), 0, -1, false, 'b', 'A', false, true, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'd', 'p', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 		`,
 	}
+
+	// Add pg_attribute view for DuckLake tables if DuckLake is configured
+	if config.CommonConfig.Ducklake.CatalogUrl != "" {
+		catalogName := config.CommonConfig.Ducklake.CatalogName
+		pgAttributeView := `CREATE VIEW pg_attribute AS
+		SELECT a.* FROM pg_catalog.pg_attribute a
+		JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
+		JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+		WHERE n.nspname IN ('pg_catalog', 'information_schema')
+		UNION ALL
+		SELECT
+			(hash(c.table_name) % 2147483647)::BIGINT AS attrelid,
+			c.column_name AS attname,
+			` + getDuckDBTypeToPostgresOidCaseExpression("c.data_type") + `::BIGINT AS atttypid,
+			-1 AS attstattarget,
+			CASE
+				WHEN c.data_type = 'BOOLEAN' THEN 1
+				WHEN c.data_type IN ('TINYINT', 'UTINYINT') THEN 1
+				WHEN c.data_type IN ('SMALLINT', 'USMALLINT') THEN 2
+				WHEN c.data_type IN ('INTEGER', 'UINTEGER') THEN 4
+				WHEN c.data_type IN ('BIGINT', 'UBIGINT') THEN 8
+				WHEN c.data_type = 'FLOAT' THEN 4
+				WHEN c.data_type = 'DOUBLE' THEN 8
+				WHEN c.data_type = 'DATE' THEN 4
+				WHEN c.data_type LIKE 'TIMESTAMP%' THEN 8
+				ELSE -1
+			END AS attlen,
+			c.column_index AS attnum,
+			0 AS attndims,
+			-1 AS attcacheoff,
+			-1 AS atttypmod,
+			FALSE AS attbyval,
+			'p' AS attstorage,
+			'i' AS attalign,
+			NOT c.is_nullable AS attnotnull,
+			FALSE AS atthasdef,
+			FALSE AS atthasmissing,
+			'' AS attidentity,
+			'' AS attgenerated,
+			FALSE AS attisdropped,
+			TRUE AS attislocal,
+			0 AS attinhcount,
+			0 AS attcollation,
+			NULL AS attcompression,
+			NULL AS attacl,
+			NULL AS attoptions,
+			NULL AS attfdwoptions,
+			NULL AS attmissingval
+		FROM duckdb_databases() d
+		JOIN duckdb_columns() c ON d.database_oid = c.database_oid
+		WHERE d.database_name = '` + catalogName + `'
+		  AND c.table_name NOT LIKE 'ducklake_%%'
+		  AND NOT c.internal`
+
+		result = append(result, pgAttributeView)
+
+		// Add pg_tables view to include DuckLake tables
+		pgTablesView := `CREATE VIEW pg_tables AS
+		SELECT * FROM pg_catalog.pg_tables
+		UNION ALL
+		SELECT
+			'public' AS schemaname,
+			t.table_name AS tablename,
+			current_user AS tableowner,
+			NULL AS tablespace,
+			FALSE AS hasindexes,
+			FALSE AS hasrules,
+			FALSE AS hastriggers
+		FROM duckdb_databases() d
+		JOIN duckdb_tables() t ON d.database_oid = t.database_oid
+		WHERE d.database_name = '` + catalogName + `'
+		  AND t.table_name NOT LIKE 'ducklake_%%'`
+
+		result = append(result, pgTablesView)
+
+		// Add pg_index entries for primary keys (tables with 'id' column)
+		// This is needed for Metabase and other BI tools to discover primary keys
+		pgIndexView := `CREATE VIEW pg_index AS
+		SELECT *, FALSE AS indnullsnotdistinct FROM (
+		SELECT * FROM pg_catalog.pg_index
+		UNION ALL
+		SELECT
+			(hash(t.table_name || '_pkey') % 2147483647)::BIGINT AS indexrelid,
+			(hash(t.table_name) % 2147483647)::BIGINT AS indrelid,
+			1 AS indnatts,
+			1 AS indnkeyatts,
+			TRUE AS indisunique,
+			TRUE AS indisprimary,
+			FALSE AS indisexclusion,
+			TRUE AS indimmediate,
+			FALSE AS indisclustered,
+			TRUE AS indisvalid,
+			FALSE AS indcheckxmin,
+			TRUE AS indisready,
+			TRUE AS indislive,
+			FALSE AS indisreplident,
+			ARRAY[1::INT2] AS indkey,
+			ARRAY[]::BIGINT[] AS indcollation,
+			ARRAY[]::BIGINT[] AS indclass,
+			ARRAY[]::INTEGER[] AS indoption,
+			NULL AS indexprs,
+			NULL::INTEGER AS indpred
+		FROM duckdb_databases() d
+		JOIN duckdb_tables() t ON d.database_oid = t.database_oid
+		WHERE d.database_name = '` + catalogName + `'
+		  AND t.table_name NOT LIKE 'ducklake_%%'
+		  AND EXISTS (
+		      SELECT 1 FROM duckdb_columns() c
+		      WHERE c.table_oid = t.table_oid
+		      AND c.column_name = 'id'
+		      AND NOT c.internal
+		  )
+		)`
+
+		result = append(result, pgIndexView)
+
+		// Add pg_indexes view for Metabase compatibility
+		pgIndexesView := `CREATE VIEW pg_indexes AS
+		SELECT
+			n.nspname AS schemaname,
+			c.relname AS tablename,
+			i.relname AS indexname,
+			NULL AS tablespace,
+			pg_get_indexdef(idx.indexrelid) AS indexdef
+		FROM pg_index idx
+		JOIN pg_class c ON idx.indrelid = c.oid
+		JOIN pg_class i ON idx.indexrelid = i.oid
+		JOIN pg_namespace n ON c.relnamespace = n.oid
+		WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')`
+
+		result = append(result, pgIndexesView)
+
+		// Add pg_constraint view for Metabase compatibility
+		// Metabase queries pg_constraint to discover primary keys
+		pgConstraintView := `CREATE VIEW pg_constraint AS
+		SELECT
+			oid, conname, connamespace, contype, condeferrable, condeferred, convalidated,
+			conrelid, contypid, conindid, conparentid, confrelid, confupdtype, confdeltype, confmatchtype,
+			conislocal, coninhcount, connoinherit, conkey, confkey, conpfeqop, conppeqop, conffeqop,
+			ARRAY[]::INTEGER[] AS confdelsetcols, conexclop, conbin
+		FROM pg_catalog.pg_constraint
+		UNION ALL
+		SELECT
+			(hash(t.table_name || '_pkey') % 2147483647)::BIGINT AS oid,
+			t.table_name || '_pkey' AS conname,
+			(SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'public') AS connamespace,
+			'p' AS contype,
+			FALSE AS condeferrable,
+			FALSE AS condeferred,
+			TRUE AS convalidated,
+			(hash(t.table_name) % 2147483647)::BIGINT AS conrelid,
+			0::INTEGER AS contypid,
+			(hash(t.table_name || '_pkey') % 2147483647)::INTEGER AS conindid,
+			0::INTEGER AS conparentid,
+			0::INTEGER AS confrelid,
+			0::INTEGER AS confupdtype,
+			0::INTEGER AS confdeltype,
+			0::INTEGER AS confmatchtype,
+			TRUE AS conislocal,
+			0 AS coninhcount,
+			FALSE AS connoinherit,
+			ARRAY[1::BIGINT] AS conkey,
+			ARRAY[]::INTEGER[] AS confkey,
+			ARRAY[]::INTEGER[] AS conpfeqop,
+			ARRAY[]::INTEGER[] AS conppeqop,
+			ARRAY[]::INTEGER[] AS conffeqop,
+			ARRAY[]::INTEGER[] AS confdelsetcols,
+			ARRAY[]::INTEGER[] AS conexclop,
+			NULL AS conbin
+		FROM duckdb_databases() d
+		JOIN duckdb_tables() t ON d.database_oid = t.database_oid
+		WHERE d.database_name = '` + catalogName + `'
+		  AND t.table_name NOT LIKE 'ducklake_%%'
+		  AND EXISTS (
+		      SELECT 1 FROM duckdb_columns() c
+		      WHERE c.table_oid = t.table_oid
+		      AND c.column_name = 'id'
+		      AND NOT c.internal
+		  )`
+
+		result = append(result, pgConstraintView)
+	} else {
+		// For non-DuckLake setups, use standard pg_index view
+		// DuckDB does not support indnullsnotdistinct column
+		result = append(result, "CREATE VIEW pg_index AS SELECT *, FALSE AS indnullsnotdistinct FROM pg_catalog.pg_index")
+	}
+
 	PG_CATALOG_TABLE_NAMES = extractTableNames(result)
 	return result
 }
 
 func CreateInformationSchemaTableQueries(config *Config) []string {
+	var tablesViewQuery string
+
+	// For DuckLake: Create view from duckdb_tables() to show attached catalog tables
+	if config.CommonConfig.Ducklake.CatalogUrl != "" {
+		catalogName := config.CommonConfig.Ducklake.CatalogName
+		tablesViewQuery = `CREATE VIEW ` + PG_TABLE_TABLES + ` AS
+		SELECT
+			'` + config.Database + `' AS table_catalog,
+			'public' AS table_schema,
+			t.table_name,
+			'BASE TABLE' AS table_type,
+			NULL AS self_referencing_column_name,
+			NULL AS reference_generation,
+			NULL AS user_defined_type_catalog,
+			NULL AS user_defined_type_schema,
+			NULL AS user_defined_type_name,
+			'YES' AS is_insertable_into,
+			'NO' AS is_typed,
+			NULL AS commit_action
+		FROM duckdb_databases() d
+		JOIN duckdb_tables() t ON d.database_oid = t.database_oid
+		WHERE d.database_name = '` + catalogName + `'
+		UNION ALL
+		SELECT
+			table_catalog,
+			table_schema,
+			table_name,
+			table_type,
+			self_referencing_column_name,
+			reference_generation,
+			user_defined_type_catalog,
+			user_defined_type_schema,
+			user_defined_type_name,
+			is_insertable_into,
+			is_typed,
+			commit_action
+		FROM information_schema.tables
+		WHERE table_type != 'VIEW' AND table_schema NOT IN ('main', 'pg_catalog', 'information_schema')`
+	} else {
+		// Legacy Iceberg mode
+		tablesViewQuery = `CREATE VIEW ` + PG_TABLE_TABLES + ` AS SELECT
+			table_catalog,
+			table_schema,
+			table_name,
+			table_type,
+			self_referencing_column_name,
+			reference_generation,
+			user_defined_type_catalog,
+			user_defined_type_schema,
+			user_defined_type_name,
+			is_insertable_into,
+			is_typed,
+			commit_action
+		FROM information_schema.tables
+		WHERE table_type != 'VIEW' AND table_schema != 'main'`
+	}
+
 	result := []string{
 		// Dynamic views
 		// DuckDB does not support udt_catalog, udt_schema, udt_name
@@ -745,31 +1179,65 @@ func CreateInformationSchemaTableQueries(config *Config) []string {
 				WHEN 'TIMESTAMP[]' THEN '_timestamp'
 				WHEN 'UUID' THEN 'uuid'
 				WHEN 'UUID[]' THEN '_uuid'
-				WHEN 'JSON' THEN 'json'
-				WHEN 'JSON[]' THEN '_json'
-			ELSE
-				CASE
-					WHEN starts_with(data_type, 'DECIMAL') THEN 'numeric'
+			WHEN 'JSON' THEN 'json'
+			WHEN 'JSON[]' THEN '_json'
+		ELSE
+			CASE
+				WHEN starts_with(data_type, 'DECIMAL') THEN 'numeric'
 		        ELSE 'unknown'
-				END
-			END AS udt_name,
-			scope_catalog, scope_schema, scope_name, maximum_cardinality, dtd_identifier, is_self_referencing, is_identity, identity_generation, identity_start, identity_increment, identity_maximum, identity_minimum, identity_cycle, is_generated, generation_expression, is_updatable
-		FROM information_schema.columns`,
-		`CREATE VIEW ` + PG_TABLE_TABLES + ` AS SELECT
-			table_catalog,
-			table_schema,
-			table_name,
-			table_type,
-			self_referencing_column_name,
-			reference_generation,
-			user_defined_type_catalog,
-			user_defined_type_schema,
-			user_defined_type_name,
-			is_insertable_into,
-			is_typed,
-			commit_action
-		FROM information_schema.tables
-		WHERE table_type != 'VIEW' AND table_schema != 'main'`,
-	}
-	return result
+			END
+		END AS udt_name,
+		scope_catalog, scope_schema, scope_name, maximum_cardinality, dtd_identifier, is_self_referencing, is_identity, identity_generation, identity_start, identity_increment, identity_maximum, identity_minimum, identity_cycle, is_generated, generation_expression, is_updatable
+	FROM information_schema.columns`,
+	`CREATE VIEW ` + PG_TABLE_TABLE_CONSTRAINTS + ` AS
+	SELECT
+		'` + config.Database + `' AS constraint_catalog,
+		n.nspname AS constraint_schema,
+		con.conname AS constraint_name,
+		'` + config.Database + `' AS table_catalog,
+		n.nspname AS table_schema,
+		cl.relname AS table_name,
+		CASE con.contype
+			WHEN 'p' THEN 'PRIMARY KEY'
+			WHEN 'u' THEN 'UNIQUE'
+			WHEN 'f' THEN 'FOREIGN KEY'
+			WHEN 'c' THEN 'CHECK'
+			ELSE 'UNKNOWN'
+		END AS constraint_type,
+		'NO' AS is_deferrable,
+		'NO' AS initially_deferred,
+		'YES' AS enforced
+	FROM pg_constraint con
+	JOIN pg_class cl ON con.conrelid = cl.oid
+	JOIN pg_namespace n ON cl.relnamespace = n.oid
+	WHERE con.contype = 'p'
+	  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+	  AND cl.relname NOT LIKE 'ducklake_%'`,
+	`CREATE VIEW ` + PG_TABLE_KEY_COLUMN_USAGE + ` AS
+	SELECT
+		'` + config.Database + `' AS constraint_catalog,
+		n.nspname AS constraint_schema,
+		con.conname AS constraint_name,
+		'` + config.Database + `' AS table_catalog,
+		n.nspname AS table_schema,
+		cl.relname AS table_name,
+		attr.attname AS column_name,
+		key_cols.ordinal_position,
+		NULL::INTEGER AS position_in_unique_constraint
+	FROM pg_constraint con
+	JOIN pg_class cl ON con.conrelid = cl.oid
+	JOIN pg_namespace n ON cl.relnamespace = n.oid
+	JOIN LATERAL (
+		SELECT
+			unnested.attnum,
+			ROW_NUMBER() OVER (ORDER BY ord)::INTEGER AS ordinal_position
+		FROM UNNEST(con.conkey) WITH ORDINALITY AS unnested(attnum, ord)
+	) key_cols ON TRUE
+	JOIN pg_attribute attr ON attr.attrelid = cl.oid AND attr.attnum = key_cols.attnum
+	WHERE con.contype = 'p'
+	  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+	  AND cl.relname NOT LIKE 'ducklake_%'`,
+	tablesViewQuery,
+}
+return result
 }

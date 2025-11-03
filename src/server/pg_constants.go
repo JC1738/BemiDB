@@ -14,12 +14,15 @@ const (
 	PG_FUNCTION_JSONB_AGG            = "jsonb_agg"
 	PG_FUNCTION_JSON_ARRAY_ELEMENTS  = "json_array_elements"
 	PG_FUNCTION_JSONB_ARRAY_ELEMENTS = "jsonb_array_elements"
+	PG_FUNCTION_DATE_TRUNC           = "date_trunc"
 
 	PG_TABLE_PG_MATVIEWS         = "pg_matviews"
 	PG_TABLE_PG_CLASS            = "pg_class"
 	PG_TABLE_PG_STAT_USER_TABLES = "pg_stat_user_tables"
 	PG_TABLE_TABLES              = "tables"
 	PG_TABLE_COLUMNS             = "columns"
+	PG_TABLE_TABLE_CONSTRAINTS   = "table_constraints"
+	PG_TABLE_KEY_COLUMN_USAGE    = "key_column_usage"
 
 	PG_VAR_SEARCH_PATH = "search_path"
 )

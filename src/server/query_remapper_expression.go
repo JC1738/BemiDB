@@ -144,6 +144,7 @@ func (remapper *QueryRemapperExpression) remapColumnReference(node *pgQuery.Node
 
 	table := fieldNames[1]
 	column := fieldNames[2]
+
 	if schema == PG_SCHEMA_PUBLIC {
 		remapper.parserColumnRef.SetFields(node, []string{table, column})
 		return

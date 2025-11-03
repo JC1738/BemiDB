@@ -10,3 +10,18 @@
 /build
 bemidb
 /src/__debug*
+/bin
+
+# Server management scripts
+ducklake-server.sh
+test-ducklake.sh
+
+# Private documentation (keep local only)
+docs/
+
+# Project context for AI assistants (keep local only)
+CLAUDE.md
+
+# DuckLake environment files (contain credentials)
+.env.ducklake
+.env.ducklake.local

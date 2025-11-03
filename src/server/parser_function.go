@@ -108,6 +108,14 @@ func (parser *ParserFunction) RemapFormatToPrintf(functionCall *pgQuery.FuncCall
 	functionCall.Args[0] = pgQuery.MakeAConstStrNode(format, 0)
 }
 
+// date_trunc('part', timestamp) -> pg_date_trunc('part', timestamp)
+// Remaps to custom macro that handles NULL values properly for Metabase JDBC compatibility
+func (parser *ParserFunction) RemapDateTruncToSafe(functionCall *pgQuery.FuncCall) {
+	// Change function name from date_trunc to pg_date_trunc
+	// pg_date_trunc macro wraps result in CASE to return NULL instead of invalid dates
+	functionCall.Funcname = []*pgQuery.Node{pgQuery.MakeStrNode("pg_date_trunc")}
+}
+
 // encode(sha256(...), 'hex') -> sha256(...)
 func (parser *ParserFunction) RemoveEncode(functionCall *pgQuery.FuncCall) {
 	if len(functionCall.Args) != 2 {

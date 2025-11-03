@@ -113,6 +113,13 @@ func (server *PostgresServer) handleExtendedQuery(queryHandler *QueryHandler, pa
 	}
 	server.writeMessages(messages...)
 
+	// Ensure prepared statement is closed when this function exits
+	defer func() {
+		if preparedStatement.Statement != nil {
+			preparedStatement.Statement.Close()
+		}
+	}()
+
 	var previousErr error
 	for {
 		message, err := server.backend.Receive()
@@ -178,6 +185,11 @@ func (server *PostgresServer) handleExtendedQuery(queryHandler *QueryHandler, pa
 			// Ignore Flush messages, as we are sending responses immediately.
 		case *pgproto3.Close:
 			common.LogDebug(server.config.CommonConfig, "Closing prepared statement", message.Name)
+			// Close the underlying statement resource
+			if preparedStatement.Statement != nil {
+				preparedStatement.Statement.Close()
+				preparedStatement.Statement = nil // Prevent double-close in defer
+			}
 			server.writeMessages(&pgproto3.CloseComplete{})
 		default:
 			common.LogError(server.config.CommonConfig, fmt.Sprintf("Received unexpected message type from client: %T", message))

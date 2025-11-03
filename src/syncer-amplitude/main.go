@@ -1,7 +1,9 @@
 package main
 
 import (
-	"github.com/BemiHQ/BemiDB/src/common"
+	"fmt"
+	"os"
+
 	"github.com/BemiHQ/BemiDB/src/syncer-amplitude/lib"
 )
 
@@ -10,6 +12,12 @@ func init() {
 }
 
 func main() {
+	// DISABLED: DuckLake integration does not require syncers
+	fmt.Println("ERROR: syncer-amplitude is disabled in DuckLake integration")
+	fmt.Println("The DuckLake catalog is managed externally and does not require BemiDB syncers.")
+	os.Exit(1)
+
+	/*
 	config := amplitude.LoadConfig()
 	defer common.HandleUnexpectedPanic(config.CommonConfig)
 
@@ -17,4 +25,5 @@ func main() {
 	duckdbClient := common.NewDuckdbClient(config.CommonConfig, common.SYNCER_DUCKDB_BOOT_QUERIES)
 	syncer := amplitude.NewSyncer(config, storageS3, duckdbClient)
 	syncer.Sync()
+	*/
 }

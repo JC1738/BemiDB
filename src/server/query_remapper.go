@@ -415,6 +415,13 @@ func (remapper *QueryRemapper) remappedExpressions(node *pgQuery.Node, remappedC
 		}
 	}
 
+	// TypeCast (e.g., value::type or CAST(value AS type))
+	// Recursively process the argument inside the cast
+	typeCast := node.GetTypeCast()
+	if typeCast != nil && typeCast.Arg != nil {
+		typeCast.Arg = remapper.remappedExpressions(typeCast.Arg, remappedColumnRefs, permissions, indentLevel+1) // self-recursion
+	}
+
 	// (FUNCTION()).n
 	indirectionFunctionCall := node.GetAIndirection()
 	if indirectionFunctionCall != nil {

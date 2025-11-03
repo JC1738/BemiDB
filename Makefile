@@ -45,6 +45,35 @@ local-syncer-attio: local-build
 local-sh:
 	docker run -it --rm --env-file .env bemidb:local bash
 
+# DuckLake Docker targets ##########################################################
+
+docker-build-ducklake:
+	docker build --build-arg PLATFORM=linux/amd64 -f Dockerfile.ducklake -t bemidb-ducklake:latest .
+
+docker-run-ducklake:
+	docker-compose -f docker-compose.ducklake.yml up
+
+docker-run-ducklake-detached:
+	docker-compose -f docker-compose.ducklake.yml up -d
+
+docker-stop-ducklake:
+	docker-compose -f docker-compose.ducklake.yml down
+
+docker-logs-ducklake:
+	docker-compose -f docker-compose.ducklake.yml logs -f
+
+docker-sh-ducklake:
+	docker run -it --rm --env-file .env.ducklake bemidb-ducklake:latest bash
+
+docker-test-ducklake: docker-build-ducklake
+	@echo "Testing DuckLake Docker image..."
+	@docker run --rm --env-file .env.ducklake -p 15432:54321 -d --name bemidb-ducklake-test bemidb-ducklake:latest
+	@sleep 5
+	@echo "Attempting connection..."
+	@psql "host=localhost port=15432 user=postgres dbname=bemidb" -c "SELECT 'Docker test successful!' AS status" || (docker stop bemidb-ducklake-test && exit 1)
+	@docker stop bemidb-ducklake-test
+	@echo "✓ Docker test passed"
+
 test-build:
 	docker build --build-arg PLATFORM=linux/arm64 -t bemidb:test -f Dockerfile.test .
 

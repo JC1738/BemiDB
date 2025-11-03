@@ -1,0 +1,89 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [main, ducklake-backend]
+    tags:
+      - 'v*.*.*-custom.*'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set lowercase image name
+        id: image_name
+        run: echo "value=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata for standard image
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image_name.outputs.value }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push standard Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PLATFORM=linux/amd64
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image_name.outputs.value }}:latest
+          cache-to: type=inline
+
+      - name: Extract metadata for DuckLake image
+        id: meta_ducklake
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image_name.outputs.value }}
+          tags: |
+            type=ref,event=branch,suffix=-ducklake
+            type=ref,event=tag,suffix=-ducklake
+            type=raw,value=ducklake-latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}},suffix=-ducklake
+            type=semver,pattern={{major}}.{{minor}},suffix=-ducklake
+
+      - name: Build and push DuckLake Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.ducklake
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta_ducklake.outputs.tags }}
+          labels: ${{ steps.meta_ducklake.outputs.labels }}
+          build-args: |
+            PLATFORM=linux/amd64
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image_name.outputs.value }}:ducklake-latest
+          cache-to: type=inline

@@ -21,9 +21,9 @@ FROM base AS compile
 
 # Install Go
 
-ENV GOROOT /usr/local/go
-ENV GOPATH /go
-ENV PATH $GOPATH/bin:$GOROOT/bin:$PATH
+ENV GOROOT=/usr/local/go
+ENV GOPATH=/go
+ENV PATH=$GOPATH/bin:$GOROOT/bin:$PATH
 
 RUN \
   ARCH=$(dpkg --print-architecture) \

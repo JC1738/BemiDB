@@ -44,6 +44,9 @@ func (view IcebergMaterializedView) ToIcebergSchemaTable() IcebergSchemaTable {
 
 // ---------------------------------------------------------------------------------------------------------------------
 
+// IcebergCatalog provides PostgreSQL-based Iceberg catalog operations
+// DEPRECATED: Replaced by DucklakeCatalog for DuckLake integration
+// Kept for reference and potential syncer re-enablement
 type IcebergCatalog struct {
 	Config *CommonConfig
 }
@@ -359,4 +362,89 @@ func (catalog *IcebergCatalog) doesMaterializedViewExist(pgClient *PostgresClien
 
 func (catalog *IcebergCatalog) newPostgresClient() *PostgresClient {
 	return NewPostgresClient(catalog.Config, catalog.Config.CatalogDatabaseUrl)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// DucklakeCatalog - Compatibility layer for DuckLake integration
+// ---------------------------------------------------------------------------------------------------------------------
+
+// DucklakeCatalog provides a compatibility layer for catalog operations
+// Most operations are no-ops since DuckLake manages the catalog externally
+type DucklakeCatalog struct {
+	Config *CommonConfig
+}
+
+func NewDucklakeCatalog(config *CommonConfig) *DucklakeCatalog {
+	return &DucklakeCatalog{
+		Config: config,
+	}
+}
+
+// SchemaTables returns tables from DuckLake catalog via DuckDB query
+func (catalog *DucklakeCatalog) SchemaTables(duckdbClient *DuckdbClient) (Set[IcebergSchemaTable], error) {
+	result := NewSet[IcebergSchemaTable]()
+
+	catalogName := catalog.Config.Ducklake.CatalogName
+	query := fmt.Sprintf(`
+		SELECT DISTINCT table_schema, table_name
+		FROM %s.information_schema.tables
+		WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+	`, catalogName)
+
+	rows, err := duckdbClient.QueryContext(context.Background(), query)
+	if err != nil {
+		return result, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var schemaName, tableName string
+		err := rows.Scan(&schemaName, &tableName)
+		if err != nil {
+			return result, err
+		}
+
+		result.Add(IcebergSchemaTable{
+			Schema: schemaName,
+			Table:  tableName,
+		})
+	}
+
+	return result, nil
+}
+
+// TableColumns returns columns for a specific table
+func (catalog *DucklakeCatalog) TableColumns(schemaTable IcebergSchemaTable) ([]CatalogTableColumn, error) {
+	// This would require a DuckDB client, which we don't have in this context
+	// Return error to indicate this should be called differently
+	return nil, fmt.Errorf("TableColumns not supported for DucklakeCatalog - use direct DuckDB queries")
+}
+
+// MetadataFileS3Path returns the DuckLake table path (not an S3 path anymore)
+func (catalog *DucklakeCatalog) MetadataFileS3Path(schemaTable IcebergSchemaTable) string {
+	// Return catalog.schema.table format instead of S3 path
+	return fmt.Sprintf("%s.%s.%s", catalog.Config.Ducklake.CatalogName, schemaTable.Schema, schemaTable.Table)
+}
+
+// MaterializedViews returns materialized views (not supported in DuckLake catalog)
+func (catalog *DucklakeCatalog) MaterializedViews() ([]IcebergMaterializedView, error) {
+	// DuckLake doesn't support materialized views in the same way
+	return []IcebergMaterializedView{}, nil
+}
+
+// Write operations are no-ops - DuckLake catalog is managed externally
+
+func (catalog *DucklakeCatalog) CreateTable(schemaTable IcebergSchemaTable, s3Path string, columns []IcebergSchemaColumn) error {
+	LogInfo(catalog.Config, "DuckLake: CreateTable is a no-op (catalog managed externally)")
+	return nil
+}
+
+func (catalog *DucklakeCatalog) DropTable(schemaTable IcebergSchemaTable) error {
+	LogInfo(catalog.Config, "DuckLake: DropTable is a no-op (catalog managed externally)")
+	return nil
+}
+
+func (catalog *DucklakeCatalog) RenameTable(oldSchemaTable, newSchemaTable IcebergSchemaTable) error {
+	LogInfo(catalog.Config, "DuckLake: RenameTable is a no-op (catalog managed externally)")
+	return nil
 }
