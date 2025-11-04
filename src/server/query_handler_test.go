@@ -258,6 +258,16 @@ func TestHandleQuery(t *testing.T) {
 				"types":       {uint32ToString(pgtype.TextOID)},
 				"values":      {"bemidb"},
 			},
+			"SELECT COALESCE(NULL, '[]'::jsonb) AS json_value": {
+				"description": {"json_value"},
+				"types":       {uint32ToString(pgtype.JSONOID)},
+				"values":      {"[]"},
+			},
+			"SELECT jsonb_array_length(COALESCE('[]'::jsonb, '{}'::jsonb)) AS length": {
+				"description": {"length"},
+				"types":       {uint32ToString(pgtype.Int8OID)},
+				"values":      {"0"},
+			},
 			"SELECT * FROM pg_catalog.pg_stat_gssapi": {
 				"description": {"pid", "gss_authenticated", "principal", "encrypted", "credentials_delegated"},
 				"types":       {uint32ToString(pgtype.Int4OID), uint32ToString(pgtype.BoolOID), uint32ToString(pgtype.TextOID), uint32ToString(pgtype.BoolOID), uint32ToString(pgtype.BoolOID)},
