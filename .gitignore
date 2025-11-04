@@ -13,7 +13,6 @@ bemidb
 /bin
 
 # Server management scripts
-ducklake-server.sh
 test-ducklake.sh
 
 # Private documentation (keep local only)
