@@ -195,7 +195,7 @@ func TestHandleQuery(t *testing.T) {
 			},
 			"SELECT jsonb_array_length('[1, 2, 3]'::jsonb)": {
 				"description": {"jsonb_array_length"},
-				"types":       {uint32ToString(pgtype.XID8OID)},
+				"types":       {uint32ToString(pgtype.Int4OID)},
 				"values":      {"3"},
 			},
 			"SELECT jsonb_pretty('{\"key\": \"value\"}'::JSONB)": {
@@ -265,7 +265,7 @@ func TestHandleQuery(t *testing.T) {
 			},
 			"SELECT jsonb_array_length(COALESCE('[]'::jsonb, '{}'::jsonb)) AS length": {
 				"description": {"length"},
-				"types":       {uint32ToString(pgtype.Int8OID)},
+				"types":       {uint32ToString(pgtype.Int4OID)},
 				"values":      {"0"},
 			},
 			"SELECT * FROM pg_catalog.pg_stat_gssapi": {
