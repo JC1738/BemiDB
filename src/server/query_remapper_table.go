@@ -1016,7 +1016,7 @@ func CreatePgCatalogTableQueries(config *Config) []string {
 		      EXISTS (
 		          SELECT 1 FROM duckdb_columns() c
 		          WHERE c.table_oid = t.table_oid
-		          AND c.column_name LIKE '%_id'
+		          AND c.column_name ~ '.*_id$'
 		          AND NOT c.internal
 		      )
 		  )
@@ -1094,7 +1094,7 @@ func CreatePgCatalogTableQueries(config *Config) []string {
 		      EXISTS (
 		          SELECT 1 FROM duckdb_columns() c
 		          WHERE c.table_oid = t.table_oid
-		          AND c.column_name LIKE '%_id'
+		          AND c.column_name ~ '.*_id$'
 		          AND NOT c.internal
 		      )
 		  )`
