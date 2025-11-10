@@ -525,11 +525,22 @@ func CreatePgCatalogTableQueries(config *Config) []string {
 		JOIN duckdb_tables() t ON d.database_oid = t.database_oid
 		WHERE d.database_name = '` + config.CommonConfig.Ducklake.CatalogName + `'
 		  AND t.table_name NOT LIKE 'ducklake_%%'
-		  AND EXISTS (
-		      SELECT 1 FROM duckdb_columns() c
-		      WHERE c.table_oid = t.table_oid
-		      AND c.column_name = 'id'
-		      AND NOT c.internal
+		  AND (
+		      -- Priority 1: Has an 'id' column
+		      EXISTS (
+		          SELECT 1 FROM duckdb_columns() c
+		          WHERE c.table_oid = t.table_oid
+		          AND c.column_name = 'id'
+		          AND NOT c.internal
+		      )
+		      OR
+		      -- Priority 2: Has a column ending with '_id' (e.g., airtable_id, user_id)
+		      EXISTS (
+		          SELECT 1 FROM duckdb_columns() c
+		          WHERE c.table_oid = t.table_oid
+		          AND c.column_name ~ '.*_id$'
+		          AND NOT c.internal
+		      )
 		  )`,
 		`CREATE VIEW pg_type AS
 			SELECT * FROM pg_catalog.pg_type
