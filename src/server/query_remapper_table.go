@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	pgQuery "github.com/pganalyze/pg_query_go/v6"
 
@@ -24,6 +26,8 @@ type QueryRemapperTable struct {
 	ServerDuckdbClient            *common.DuckdbClient // nilable
 	catalogCache                  *CatalogCache        // Cache for pg_catalog metadata
 	config                        *Config
+	lastDucklakeTablesReload      time.Time   // Last time DuckLake tables were reloaded
+	ducklakeTablesReloadMu        sync.Mutex  // Mutex to protect lastDucklakeTablesReload
 }
 
 func NewQueryRemapperTable(config *Config, icebergReader *IcebergReader, serverDuckdbClient *common.DuckdbClient, catalogCache *CatalogCache) *QueryRemapperTable {
@@ -230,6 +234,19 @@ func (remapper *QueryRemapperTable) reloadIcebergPersistentTables() {
 }
 
 func (remapper *QueryRemapperTable) reloadDucklakeTables() {
+	// Cache table list for 15 minutes to avoid excessive Neon catalog queries
+	// This prevents SSL connection timeouts during long Metabase syncs
+	remapper.ducklakeTablesReloadMu.Lock()
+	timeSinceLastReload := time.Since(remapper.lastDucklakeTablesReload)
+	hasTablesLoaded := len(remapper.IcebergPersistentSchemaTables) > 0
+	remapper.ducklakeTablesReloadMu.Unlock()
+
+	// Use cached data if less than 15 minutes old and we have tables
+	if timeSinceLastReload < 15*time.Minute && hasTablesLoaded {
+		common.LogDebug(remapper.config.CommonConfig, fmt.Sprintf("DuckLake: Using cached table list (%d tables, age: %.1f minutes)", len(remapper.IcebergPersistentSchemaTables), timeSinceLastReload.Minutes()))
+		return
+	}
+
 	ctx := context.Background()
 
 	// Query DuckLake catalog for available tables using duckdb_tables() function
@@ -243,6 +260,7 @@ func (remapper *QueryRemapperTable) reloadDucklakeTables() {
 		  AND t.table_name NOT LIKE 'ducklake_%%'
 	`, catalogName)
 
+	common.LogDebug(remapper.config.CommonConfig, "DuckLake: Reloading tables from Neon catalog...")
 	rows, err := remapper.ServerDuckdbClient.QueryContext(ctx, query)
 	common.PanicIfError(remapper.config.CommonConfig, err)
 	defer rows.Close()
@@ -267,6 +285,11 @@ func (remapper *QueryRemapperTable) reloadDucklakeTables() {
 	}
 
 	remapper.IcebergPersistentSchemaTables = newIcebergSchemaTables
+
+	// Update last reload timestamp
+	remapper.ducklakeTablesReloadMu.Lock()
+	remapper.lastDucklakeTablesReload = time.Now()
+	remapper.ducklakeTablesReloadMu.Unlock()
 
 	common.LogInfo(remapper.config.CommonConfig, fmt.Sprintf("DuckLake: Loaded %d tables from catalog", len(newIcebergSchemaTables)))
 
