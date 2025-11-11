@@ -41,19 +41,47 @@ func main() {
 	tcpListener := NewTcpListener(config)
 	common.LogInfo(config.CommonConfig, "BemiDB: Listening on", tcpListener.Addr())
 
-	duckdbClient := common.NewDuckdbClient(config.CommonConfig, duckdbBootQueris(config))
+	// Phase 1: Create DuckDB client with basic initialization (no pg_catalog yet)
+	duckdbClient := common.NewDuckdbClient(config.CommonConfig, duckdbBootQueriesPhase1(config))
 	common.LogInfo(config.CommonConfig, "DuckDB: Connected")
 	defer duckdbClient.Close()
 
-	// Initialize DuckLake catalog if configured
+	// Phase 2: Initialize DuckLake and build cache (for DuckLake mode)
+	var catalogCache *CatalogCache
+	var catalogCacheSQLite *CatalogCacheSQLite
 	if config.CommonConfig.Ducklake.CatalogUrl != "" {
 		ctx := context.Background()
 		err := duckdbClient.InitializeDucklake(ctx)
 		common.PanicIfError(config.CommonConfig, err)
 		common.LogInfo(config.CommonConfig, "DuckLake: Initialized")
+
+		// Build catalog cache BEFORE creating pg_catalog tables
+		catalogCache = NewCatalogCache()
+		err = catalogCache.BuildCache(ctx, duckdbClient, config.CommonConfig.Ducklake.CatalogName, config.CommonConfig)
+		if err != nil {
+			common.LogWarn(config.CommonConfig, "Failed to build catalog cache:", err)
+		} else {
+			common.LogInfo(config.CommonConfig, "CatalogCache: Ready")
+		}
+
+		// Build in-memory SQLite cache for sub-second catalog queries
+		catalogCacheSQLite, err = NewCatalogCacheSQLite(catalogCache, config.CommonConfig)
+		if err != nil {
+			common.LogWarn(config.CommonConfig, "Failed to build SQLite catalog cache:", err)
+		} else {
+			common.LogInfo(config.CommonConfig, "CatalogCache: SQLite ready for fast queries")
+		}
 	}
 
-	queryHandler := NewQueryHandler(config, duckdbClient)
+	// Phase 3: Create pg_catalog tables/views with populated cache
+	ctx := context.Background()
+	for _, query := range duckdbBootQueriesPhase2(config, catalogCache) {
+		_, err := duckdbClient.ExecContext(ctx, query)
+		common.PanicIfError(config.CommonConfig, err)
+	}
+	common.LogInfo(config.CommonConfig, "pg_catalog: Initialized")
+
+	queryHandler := NewQueryHandler(config, duckdbClient, catalogCache, catalogCacheSQLite)
 
 	// Connection limiting to prevent resource exhaustion
 	connectionSemaphore := make(chan struct{}, config.MaxConnections)
@@ -79,7 +107,8 @@ func main() {
 	}
 }
 
-func duckdbBootQueris(config *Config) []string {
+// Phase 1: Basic DuckDB setup (before cache is built)
+func duckdbBootQueriesPhase1(config *Config) []string {
 	var bootQueries []string
 
 	// Use DuckLake boot queries if DuckLake is configured, otherwise use Iceberg
@@ -103,13 +132,18 @@ func duckdbBootQueris(config *Config) []string {
 			"SELECT oid FROM pg_catalog.pg_namespace",
 			"CREATE SCHEMA " + PG_SCHEMA_PUBLIC,
 		},
+	)
+}
 
+// Phase 2: pg_catalog setup (after cache is built)
+func duckdbBootQueriesPhase2(config *Config, catalogCache *CatalogCache) []string {
+	return slices.Concat(
 		// Create pg-compatible functions
 		CreatePgCatalogMacroQueries(config),
 		CreateInformationSchemaMacroQueries(config),
 
-		// Create pg-compatible tables and views
-		CreatePgCatalogTableQueries(config),
+		// Create pg-compatible tables and views (with populated cache)
+		CreatePgCatalogTableQueries(config, catalogCache),
 		CreateInformationSchemaTableQueries(config),
 
 		// Use the public schema

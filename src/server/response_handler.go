@@ -100,6 +100,11 @@ func (responseHandler *ResponseHandler) ColumnDescriptionTypeOid(col *sql.Column
 		return pgtype.JSONOID
 	}
 
+	// Handle STRUCT types (return as JSON)
+	if strings.HasPrefix(col.DatabaseTypeName(), "STRUCT(") {
+		return pgtype.JSONOID
+	}
+
 	if strings.HasPrefix(col.DatabaseTypeName(), "DECIMAL") {
 		if strings.HasSuffix(col.DatabaseTypeName(), "[]") {
 			return pgtype.NumericArrayOID
@@ -135,10 +140,15 @@ func (responseHandler *ResponseHandler) RowValuePointer(col *sql.ColumnType) int
 		return new(NullDecimal)
 	case "duckdb.Interval":
 		return new(NullInterval)
-	case "interface {}": // json, jsonb
+	case "interface {}": // json, jsonb, STRUCT
 		return new(NullJson)
 	case "[]interface {}":
 		return new(NullArray)
+	}
+
+	// Handle STRUCT types specifically
+	if strings.HasPrefix(col.DatabaseTypeName(), "STRUCT(") {
+		return new(NullJson)
 	}
 
 	common.Panic(responseHandler.Config.CommonConfig, "Unsupported data row type: "+col.ScanType().String())

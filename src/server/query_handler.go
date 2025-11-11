@@ -24,6 +24,7 @@ type QueryHandler struct {
 	ServerDuckdbClient *common.DuckdbClient
 	QueryRemapper      *QueryRemapper
 	ResponseHandler    *ResponseHandler
+	CatalogCacheSQLite *CatalogCacheSQLite // In-memory SQLite for fast catalog queries
 }
 
 type PreparedStatement struct {
@@ -48,7 +49,7 @@ type PreparedStatement struct {
 	CancelContext context.CancelFunc
 }
 
-func NewQueryHandler(config *Config, serverDuckdbClient *common.DuckdbClient) *QueryHandler {
+func NewQueryHandler(config *Config, serverDuckdbClient *common.DuckdbClient, catalogCache *CatalogCache, catalogCacheSQLite *CatalogCacheSQLite) *QueryHandler {
 	storageS3 := common.NewStorageS3(config.CommonConfig)
 
 	// Create appropriate catalog based on configuration
@@ -71,8 +72,9 @@ func NewQueryHandler(config *Config, serverDuckdbClient *common.DuckdbClient) *Q
 	queryHandler := &QueryHandler{
 		Config:             config,
 		ServerDuckdbClient: serverDuckdbClient,
-		QueryRemapper:      NewQueryRemapper(config, icebergReader, icebergWriter, serverDuckdbClient),
+		QueryRemapper:      NewQueryRemapper(config, icebergReader, icebergWriter, serverDuckdbClient, catalogCache),
 		ResponseHandler:    NewResponseHandler(config),
+		CatalogCacheSQLite: catalogCacheSQLite,
 	}
 
 	return queryHandler
@@ -98,7 +100,15 @@ func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgp
 	for i, queryStatement := range queryStatements {
 		ctx, cancel := queryHandler.createQueryContext()
 		defer cancel()
-		rows, err := queryHandler.ServerDuckdbClient.QueryContext(ctx, queryStatement)
+
+		// Try to intercept catalog queries with SQLite cache
+		var rows *sql.Rows
+		if queryHandler.CatalogCacheSQLite != nil && ShouldIntercept(queryStatement) {
+			common.LogDebug(queryHandler.Config.CommonConfig, "CatalogCache: Intercepting catalog query with SQLite")
+			rows, err = queryHandler.CatalogCacheSQLite.QueryContext(ctx, queryStatement)
+		} else {
+			rows, err = queryHandler.ServerDuckdbClient.QueryContext(ctx, queryStatement)
+		}
 		if err != nil {
 			errorMessage := err.Error()
 			if errorMessage == "Binder Error: UNNEST requires a single list as input" {

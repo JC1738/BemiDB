@@ -53,6 +53,7 @@ require (
 	github.com/linkedin/goavro v2.1.0+incompatible // indirect
 	github.com/marcboeker/go-duckdb/arrowmapping v0.0.21 // indirect
 	github.com/marcboeker/go-duckdb/mapping v0.0.21 // indirect
+	github.com/mattn/go-sqlite3 v1.14.32 // indirect
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/xitongsys/parquet-go v1.6.2 // indirect
 	github.com/xitongsys/parquet-go-source v0.0.0-20241021075129-b732d2ac9c9b // indirect
