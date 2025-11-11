@@ -115,7 +115,7 @@ func (server *PostgresServer) handleExtendedQuery(queryHandler *QueryHandler, pa
 
 	// Ensure prepared statement is closed when this function exits
 	defer func() {
-		if preparedStatement.Statement != nil {
+		if preparedStatement != nil && preparedStatement.Statement != nil {
 			preparedStatement.Statement.Close()
 		}
 	}()
