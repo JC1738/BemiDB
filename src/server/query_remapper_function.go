@@ -42,7 +42,7 @@ func CreatePgCatalogMacroQueries(config *Config) []string {
 			ELSE json_extract_path_text(from_json, path_elems)::varchar
 		END`,
 		`CREATE MACRO jsonb_object_agg(key, value) AS to_json(map(array_agg(key), array_agg(value)))`,
-		`CREATE MACRO jsonb_array_length(json) AS json_array_length(json)`,
+		`CREATE MACRO jsonb_array_length(json) AS CAST(json_array_length(json) AS INTEGER)`,
 		`CREATE MACRO jsonb_pretty(json) AS json_pretty(json)`,
 		`CREATE MACRO json_array_elements(json) AS unnest(json_extract(json, '$[*]'))`,
 		`CREATE MACRO jsonb_array_elements(json) AS unnest(json_extract(json, '$[*]'))`,
@@ -55,17 +55,23 @@ func CreatePgCatalogMacroQueries(config *Config) []string {
 			WHEN 1 THEN len(arr)
 			ELSE NULL
 		END`,
-		`CREATE MACRO to_char(timestamp, text) AS
-			CASE text
-			WHEN 'YYYY-MM-DD' THEN strftime(timestamp, '%Y-%m-%d')
-			WHEN 'YYYY-MM-DD HH24:MI:SS' THEN strftime(timestamp, '%Y-%m-%d %H:%M:%S')
-			WHEN 'MM/DD/YYYY' THEN strftime(timestamp, '%m/%d/%Y')
-			WHEN 'DD-MON-YYYY' THEN strftime(timestamp, '%d-%b-%Y')
-			WHEN 'HH24:MI:SS' THEN strftime(timestamp, '%H:%M:%S')
-			WHEN 'YYYY' THEN strftime(timestamp, '%Y')
-			WHEN 'MM' THEN strftime(timestamp, '%m')
-			WHEN 'DD' THEN strftime(timestamp, '%d')
-			ELSE strftime(timestamp, text)
+		`CREATE MACRO to_char(ts_val, text_format) AS
+			CASE text_format
+			WHEN 'YYYY-MM-DD' THEN strftime(ts_val, '%Y-%m-%d')
+			WHEN 'YYYY-MM-DD HH24:MI:SS' THEN strftime(ts_val, '%Y-%m-%d %H:%M:%S')
+			WHEN 'MM/DD/YYYY' THEN strftime(ts_val, '%m/%d/%Y')
+			WHEN 'DD-MON-YYYY' THEN strftime(ts_val, '%d-%b-%Y')
+			WHEN 'HH24:MI:SS' THEN strftime(ts_val, '%H:%M:%S')
+			WHEN 'YYYY' THEN strftime(ts_val, '%Y')
+			WHEN 'MM' THEN strftime(ts_val, '%m')
+			WHEN 'DD' THEN strftime(ts_val, '%d')
+			ELSE strftime(ts_val, text_format)
+		END`,
+		// Safe date_trunc wrapper to handle NULL values properly for Metabase JDBC compatibility
+		// DuckDB's date_trunc on NULL in GROUP BY produces invalid dates that break Java date parsing
+		`CREATE MACRO pg_date_trunc(date_part, timestamp_val) AS
+			CASE WHEN timestamp_val IS NULL THEN CAST(NULL AS TIMESTAMP)
+			ELSE date_trunc(date_part, timestamp_val)
 		END`,
 
 		// Table functions
@@ -162,6 +168,11 @@ func (remapper *QueryRemapperFunction) RemapFunctionCall(functionCall *pgQuery.F
 	// encode(sha256(...), 'hex') -> sha256(...)
 	case schemaFunction.Function == PG_FUNCTION_ENCODE:
 		remapper.parserFunction.RemoveEncode(functionCall)
+		return schemaFunction
+
+	// date_trunc('part', timestamp) -> pg_date_trunc('part', timestamp)
+	case schemaFunction.Function == PG_FUNCTION_DATE_TRUNC:
+		remapper.parserFunction.RemapDateTruncToSafe(functionCall)
 		return schemaFunction
 	}
 

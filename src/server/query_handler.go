@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -42,13 +43,29 @@ type PreparedStatement struct {
 	Described bool
 
 	// Describe/Execute
-	Rows *sql.Rows
+	Rows          *sql.Rows
+	QueryContext  context.Context
+	CancelContext context.CancelFunc
 }
 
 func NewQueryHandler(config *Config, serverDuckdbClient *common.DuckdbClient) *QueryHandler {
 	storageS3 := common.NewStorageS3(config.CommonConfig)
-	icebergCatalog := common.NewIcebergCatalog(config.CommonConfig)
-	icebergReader := NewIcebergReader(config, icebergCatalog)
+
+	// Create appropriate catalog based on configuration
+	var catalog interface{}
+	if config.CommonConfig.Ducklake.CatalogUrl != "" {
+		catalog = common.NewDucklakeCatalog(config.CommonConfig)
+	} else {
+		catalog = common.NewIcebergCatalog(config.CommonConfig)
+	}
+
+	icebergReader := NewIcebergReader(config, catalog)
+
+	// IcebergWriter still uses IcebergCatalog (only for legacy mode)
+	var icebergCatalog *common.IcebergCatalog
+	if config.CommonConfig.Ducklake.CatalogUrl == "" {
+		icebergCatalog = catalog.(*common.IcebergCatalog)
+	}
 	icebergWriter := NewIcebergWriter(config, storageS3, serverDuckdbClient, icebergCatalog)
 
 	queryHandler := &QueryHandler{
@@ -59,6 +76,12 @@ func NewQueryHandler(config *Config, serverDuckdbClient *common.DuckdbClient) *Q
 	}
 
 	return queryHandler
+}
+
+// createQueryContext creates a context with timeout based on config
+func (queryHandler *QueryHandler) createQueryContext() (context.Context, context.CancelFunc) {
+	timeout := time.Duration(queryHandler.Config.CommonConfig.QueryTimeout) * time.Second
+	return context.WithTimeout(context.Background(), timeout)
 }
 
 func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgproto3.Message, error) {
@@ -73,7 +96,9 @@ func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgp
 	var queriesMessages []pgproto3.Message
 
 	for i, queryStatement := range queryStatements {
-		rows, err := queryHandler.ServerDuckdbClient.QueryContext(context.Background(), queryStatement)
+		ctx, cancel := queryHandler.createQueryContext()
+		defer cancel()
+		rows, err := queryHandler.ServerDuckdbClient.QueryContext(ctx, queryStatement)
 		if err != nil {
 			errorMessage := err.Error()
 			if errorMessage == "Binder Error: UNNEST requires a single list as input" {
@@ -202,14 +227,21 @@ func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe
 		return []pgproto3.Message{&pgproto3.NoData{}}, preparedStatement, nil
 	}
 
-	rows, err := preparedStatement.Statement.QueryContext(context.Background(), preparedStatement.Variables...)
+	// Create context that will live for the entire Describe->Execute cycle
+	ctx, cancel := queryHandler.createQueryContext()
+	preparedStatement.QueryContext = ctx
+	preparedStatement.CancelContext = cancel
+
+	rows, err := preparedStatement.Statement.QueryContext(ctx, preparedStatement.Variables...)
 	if err != nil {
+		cancel() // Clean up context on error
 		return nil, nil, fmt.Errorf("couldn't execute statement: %w. Original query: %s", err, preparedStatement.OriginalQuery)
 	}
 	preparedStatement.Rows = rows
 
 	messages, err := queryHandler.rowsToDescriptionMessages(preparedStatement.Rows, preparedStatement.OriginalQuery)
 	if err != nil {
+		cancel() // Clean up context on error
 		return nil, nil, err
 	}
 	return messages, preparedStatement, nil
@@ -225,14 +257,23 @@ func (queryHandler *QueryHandler) HandleExecuteQuery(message *pgproto3.Execute, 
 	}
 
 	if preparedStatement.Rows == nil { // Parse->[No Bind]->Describe->Execute or Parse->Bind->[No Describe]->Execute
-		rows, err := preparedStatement.Statement.QueryContext(context.Background(), preparedStatement.Variables...)
+		ctx, cancel := queryHandler.createQueryContext()
+		preparedStatement.QueryContext = ctx
+		preparedStatement.CancelContext = cancel
+
+		rows, err := preparedStatement.Statement.QueryContext(ctx, preparedStatement.Variables...)
 		if err != nil {
+			cancel() // Clean up context on error
 			return nil, err
 		}
 		preparedStatement.Rows = rows
 	}
 
 	defer preparedStatement.Rows.Close()
+	// Clean up context after rows are consumed (if context was created)
+	if preparedStatement.CancelContext != nil {
+		defer preparedStatement.CancelContext()
+	}
 
 	return queryHandler.rowsToDataMessages(preparedStatement.Rows, preparedStatement.OriginalQuery)
 }

@@ -1,0 +1,62 @@
+# DuckLake-specific Dockerfile for BemiDB
+# This builds a server-only image for DuckLake integration (no syncers)
+# Syncers are disabled in DuckLake mode as the catalog is managed externally
+
+ARG PLATFORM=linux/amd64
+
+FROM --platform=$PLATFORM debian:12-slim AS base
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+  curl ca-certificates \
+  postgresql-client \
+  gcc g++ libc6-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN adduser --disabled-login app
+
+WORKDIR /app
+
+# Set up server ########################################################################
+
+FROM base AS compile
+
+# Install Go
+
+ENV GOROOT=/usr/local/go
+ENV GOPATH=/go
+ENV PATH=$GOPATH/bin:$GOROOT/bin:$PATH
+
+RUN \
+  ARCH=$(dpkg --print-architecture) \
+  && curl -L "https://go.dev/dl/go1.24.4.linux-$ARCH.tar.gz" -o go.tar.gz \
+  && tar -C /usr/local -xzf go.tar.gz \
+  && rm go.tar.gz \
+  && mkdir -p "$GOPATH/src" "$GOPATH/bin" \
+  && chmod -R 777 "$GOPATH"
+
+# Compile server only (no syncers)
+
+COPY --chown=app:app src/common/go.mod src/common/go.sum /app/src/common/
+
+COPY --chown=app:app src/server/go.mod src/server/go.sum /app/src/server/
+RUN cd /app/src/server && go mod download
+
+COPY --chown=app:app src/common /app/src/common
+COPY --chown=app:app src/server /app/src/server
+
+RUN ARCH=$(dpkg --print-architecture) \
+  && cd /app/src/server && CGO_ENABLED=1 GOOS=linux GOARCH=$ARCH go build -o /app/bin/server
+
+# Prepare final image ##############################################################################
+
+FROM base AS final
+
+COPY --chown=app:app --from=compile /app/bin/server /app/bin/
+COPY --chown=app:app docker/bin/run-ducklake.sh /app/bin/
+
+RUN chmod +x /app/bin/run-ducklake.sh
+
+USER app
+
+ENTRYPOINT ["/app/bin/run-ducklake.sh"]

@@ -1,0 +1,24 @@
+services:
+  bemidb:
+    build:
+      context: .
+      dockerfile: Dockerfile.ducklake
+      args:
+        PLATFORM: linux/amd64
+    image: bemidb-ducklake:latest
+    container_name: bemidb-ducklake
+    env_file:
+      - .env.ducklake
+    ports:
+      - "15432:15432"
+
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p ${BEMIDB_PORT:-54321} -U ${BEMIDB_USER:-postgres} -d ${BEMIDB_DATABASE:-bemidb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # Optional: Mount for custom configurations
+    # volumes:
+    #   - ./config:/app/config:ro

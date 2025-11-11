@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -21,6 +23,17 @@ func main() {
 	config := LoadConfig()
 	defer common.HandleUnexpectedPanic(config.CommonConfig)
 
+	// Debug: Verify configuration loading
+	common.LogDebug(config.CommonConfig, "=== Configuration Debug ===")
+	common.LogDebug(config.CommonConfig, fmt.Sprintf("DuckLake.CatalogUrl: '%s'", config.CommonConfig.Ducklake.CatalogUrl))
+	common.LogDebug(config.CommonConfig, fmt.Sprintf("DuckLake.CatalogName: '%s'", config.CommonConfig.Ducklake.CatalogName))
+	common.LogDebug(config.CommonConfig, fmt.Sprintf("DuckLake.DataPath: '%s'", config.CommonConfig.Ducklake.DataPath))
+	common.LogDebug(config.CommonConfig, fmt.Sprintf("R2.AccountId: '%s'", config.CommonConfig.R2.AccountId))
+	common.LogDebug(config.CommonConfig, "R2.AccessKeyId: [REDACTED]")
+	common.LogDebug(config.CommonConfig, "R2.SecretAccessKey: [REDACTED]")
+	common.LogDebug(config.CommonConfig, fmt.Sprintf("CatalogDatabaseUrl: '%s'", config.CommonConfig.CatalogDatabaseUrl))
+	common.LogDebug(config.CommonConfig, "=== End Configuration ===")
+
 	if config.CommonConfig.LogLevel == common.LOG_LEVEL_TRACE {
 		go enableProfiling()
 	}
@@ -32,16 +45,32 @@ func main() {
 	common.LogInfo(config.CommonConfig, "DuckDB: Connected")
 	defer duckdbClient.Close()
 
+	// Initialize DuckLake catalog if configured
+	if config.CommonConfig.Ducklake.CatalogUrl != "" {
+		ctx := context.Background()
+		err := duckdbClient.InitializeDucklake(ctx)
+		common.PanicIfError(config.CommonConfig, err)
+		common.LogInfo(config.CommonConfig, "DuckLake: Initialized")
+	}
+
 	queryHandler := NewQueryHandler(config, duckdbClient)
+
+	// Connection limiting to prevent resource exhaustion
+	connectionSemaphore := make(chan struct{}, config.MaxConnections)
+	common.LogInfo(config.CommonConfig, "BemiDB: Max concurrent connections:", common.IntToString(config.MaxConnections))
 
 	var connectionCount int64 = 0
 	for {
+		// Block if at max connections (semaphore pattern)
+		connectionSemaphore <- struct{}{}
+
 		conn := AcceptConnection(config, tcpListener)
 		atomic.AddInt64(&connectionCount, 1)
 		common.LogInfo(config.CommonConfig, "BemiDB: Accepted", common.Int64ToString(atomic.LoadInt64(&connectionCount))+"th", "connection from", conn.RemoteAddr())
 		server := NewPostgresServer(config, &conn)
 
 		go func() {
+			defer func() { <-connectionSemaphore }() // Release semaphore slot
 			server.Run(queryHandler)
 			defer server.Close()
 			common.LogInfo(config.CommonConfig, "BemiDB: Closed", common.Int64ToString(atomic.LoadInt64(&connectionCount))+"th", "connection from", conn.RemoteAddr())
@@ -51,20 +80,28 @@ func main() {
 }
 
 func duckdbBootQueris(config *Config) []string {
-	return slices.Concat(
-		[]string{
-			// Set up Iceberg
+	var bootQueries []string
+
+	// Use DuckLake boot queries if DuckLake is configured, otherwise use Iceberg
+	if config.CommonConfig.Ducklake.CatalogUrl != "" {
+		bootQueries = common.GetDucklakeServerBootQueries(config.CommonConfig)
+	} else {
+		bootQueries = []string{
+			// Set up Iceberg (legacy)
 			"INSTALL iceberg",
 			"LOAD iceberg",
-
-			// Set up schemas
-			"SELECT oid FROM pg_catalog.pg_namespace",
-			"CREATE SCHEMA " + PG_SCHEMA_PUBLIC,
-
-			// Configure DuckDB
 			"SET memory_limit='3GB'",
 			"SET threads=2",
 			"SET scalar_subquery_error_on_multiple_rows=false",
+		}
+	}
+
+	return slices.Concat(
+		bootQueries,
+		[]string{
+			// Set up schemas
+			"SELECT oid FROM pg_catalog.pg_namespace",
+			"CREATE SCHEMA " + PG_SCHEMA_PUBLIC,
 		},
 
 		// Create pg-compatible functions

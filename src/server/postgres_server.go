@@ -113,6 +113,13 @@ func (server *PostgresServer) handleExtendedQuery(queryHandler *QueryHandler, pa
 	}
 	server.writeMessages(messages...)
 
+	// Ensure prepared statement is closed when this function exits
+	defer func() {
+		if preparedStatement.Statement != nil {
+			preparedStatement.Statement.Close()
+		}
+	}()
+
 	var previousErr error
 	for {
 		message, err := server.backend.Receive()
@@ -178,6 +185,11 @@ func (server *PostgresServer) handleExtendedQuery(queryHandler *QueryHandler, pa
 			// Ignore Flush messages, as we are sending responses immediately.
 		case *pgproto3.Close:
 			common.LogDebug(server.config.CommonConfig, "Closing prepared statement", message.Name)
+			// Close the underlying statement resource
+			if preparedStatement.Statement != nil {
+				preparedStatement.Statement.Close()
+				preparedStatement.Statement = nil // Prevent double-close in defer
+			}
 			server.writeMessages(&pgproto3.CloseComplete{})
 		default:
 			common.LogError(server.config.CommonConfig, fmt.Sprintf("Received unexpected message type from client: %T", message))
@@ -225,6 +237,33 @@ func (server *PostgresServer) handleStartup() error {
 		if server.config.User != "" && params["user"] != server.config.User && params["user"] != SYSTEM_AUTH_USER {
 			server.writeError(errors.New("role \"" + params["user"] + "\" does not exist"))
 			return errors.New("role does not exist")
+		}
+
+		// If password is configured, request and validate it
+		if server.config.Password != "" {
+			// Request password authentication
+			server.writeMessages(&pgproto3.AuthenticationCleartextPassword{})
+
+			// Receive password response
+			msg, err := server.backend.Receive()
+			if err != nil {
+				server.writeError(errors.New("failed to receive password"))
+				return errors.New("failed to receive password")
+			}
+
+			passwordMsg, ok := msg.(*pgproto3.PasswordMessage)
+			if !ok {
+				server.writeError(errors.New("expected password message"))
+				return errors.New("expected password message")
+			}
+
+			// Validate password
+			if passwordMsg.Password != server.config.Password {
+				server.writeError(errors.New("password authentication failed for user \"" + params["user"] + "\""))
+				return errors.New("password authentication failed")
+			}
+
+			common.LogDebug(server.config.CommonConfig, "BemiDB: password authentication successful")
 		}
 
 		server.writeMessages(

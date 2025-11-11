@@ -47,6 +47,8 @@ func (parser *ParserTable) IsTableFromInformationSchema(qSchemaTable QuerySchema
 
 // public.table -> (SELECT * FROM iceberg_scan('path')) table
 // schema.table -> (SELECT * FROM iceberg_scan('path')) schema_table
+// MakeIcebergTableNode creates a table reference node for Iceberg tables
+// DEPRECATED: Used by legacy Iceberg catalog. Use MakeDucklakeTableNode() for DuckLake.
 // public.table -> (SELECT permitted, columns FROM iceberg_scan('path')) table
 // public.table -> (SELECT NULL WHERE FALSE) table
 // public.table t -> (SELECT * FROM iceberg_scan('path')) t
@@ -67,18 +69,64 @@ func (parser *ParserTable) MakeIcebergTableNode(queryToIcebergTable QueryToIcebe
 	return parser.makeSubselectNode(query, queryToIcebergTable.QuerySchemaTable)
 }
 
+// MakeDucklakeTableNode creates a table reference node for DuckLake
+// Unlike Iceberg which uses iceberg_scan(), DuckLake uses direct table references
+// PERFORMANCE: Uses direct RangeVar nodes to allow DuckDB query optimizer to push down LIMIT/WHERE/column filters
+func (parser *ParserTable) MakeDucklakeTableNode(queryToIcebergTable QueryToIcebergTable, permissions *map[string][]string) *pgQuery.Node {
+	ducklakeTablePath := queryToIcebergTable.IcebergTablePath // Format: catalog.schema.table
+
+	// Quote each component to preserve case sensitivity
+	// catalog.schema.table -> "catalog"."schema"."table"
+	parts := strings.Split(ducklakeTablePath, ".")
+	quotedParts := make([]string, len(parts))
+	for i, part := range parts {
+		quotedParts[i] = "\"" + part + "\""
+	}
+	quotedTablePath := strings.Join(quotedParts, ".")
+
+	if permissions == nil {
+		// NO PERMISSIONS: Use direct table reference for optimal performance
+		// This allows DuckDB to push down LIMIT, WHERE, and column projections
+		return parser.makeDirectTableNode(quotedTablePath, queryToIcebergTable.QuerySchemaTable)
+	} else if columnNames, allowed := (*permissions)[queryToIcebergTable.QuerySchemaTable.ToIcebergSchemaTable().ToArg()]; allowed {
+		// WITH PERMISSIONS: Use subquery to filter columns
+		// TODO: Optimize this case to avoid subquery if possible
+		quotedColumnNames := make([]string, len(columnNames))
+		for i, columnName := range columnNames {
+			quotedColumnNames[i] = "\"" + columnName + "\""
+		}
+		query := "SELECT " + strings.Join(quotedColumnNames, ", ") + " FROM " + quotedTablePath
+		return parser.makeSubselectNode(query, queryToIcebergTable.QuerySchemaTable)
+	} else {
+		// NO ACCESS: Return empty result set
+		query := "SELECT NULL WHERE FALSE"
+		return parser.makeSubselectNode(query, queryToIcebergTable.QuerySchemaTable)
+	}
+}
+
 // information_schema.tables -> (SELECT * FROM main.tables) information_schema_tables
 // information_schema.tables -> (SELECT * FROM main.tables WHERE table_schema || '.' || table_name IN ('permitted.table')) information_schema_tables
 // information_schema.tables t -> (SELECT * FROM main.tables) t
-func (parser *ParserTable) MakeInformationSchemaTablesNode(qSchemaTable QuerySchemaTable, permissions *map[string][]string) *pgQuery.Node {
-	query := "SELECT * FROM main.tables"
+func (parser *ParserTable) MakeInformationSchemaTablesNode(qSchemaTable QuerySchemaTable, permissions *map[string][]string, isDucklake bool) *pgQuery.Node {
+	// Filter out internal DuckLake catalog tables (ducklake_*)
+	var query string
+	if isDucklake {
+		// For DuckLake, map 'main' schema to 'public' for Postgres compatibility
+		query = "SELECT table_catalog, CASE WHEN table_schema = 'main' THEN 'public' ELSE table_schema END AS table_schema, table_name, table_type FROM main.tables WHERE table_name NOT LIKE 'ducklake_%'"
+	} else {
+		query = "SELECT * FROM main.tables WHERE table_name NOT LIKE 'ducklake_%'"
+	}
 
 	if permissions != nil {
 		quotedSchemaTableNames := []string{}
 		for schemaTable := range *permissions {
 			quotedSchemaTableNames = append(quotedSchemaTableNames, "'"+schemaTable+"'")
 		}
-		query += " WHERE table_schema || '.' || table_name IN (" + strings.Join(quotedSchemaTableNames, ", ") + ")"
+		if isDucklake {
+			query += " AND (CASE WHEN table_schema = 'main' THEN 'public' ELSE table_schema END) || '.' || table_name IN (" + strings.Join(quotedSchemaTableNames, ", ") + ")"
+		} else {
+			query += " AND table_schema || '.' || table_name IN (" + strings.Join(quotedSchemaTableNames, ", ") + ")"
+		}
 	}
 
 	return parser.makeSubselectNode(query, qSchemaTable)
@@ -87,8 +135,15 @@ func (parser *ParserTable) MakeInformationSchemaTablesNode(qSchemaTable QuerySch
 // information_schema.columns -> (SELECT * FROM main.columns) information_schema_columns
 // information_schema.columns -> (SELECT * FROM main.columns WHERE (table_schema || '.' || table_name IN ('permitted.table') AND column_name IN ('permitted', 'columns')) OR ...) information_schema_columns
 // information_schema.columns c -> (SELECT * FROM main.columns) c
-func (parser *ParserTable) MakeInformationSchemaColumnsNode(qSchemaTable QuerySchemaTable, permissions *map[string][]string) *pgQuery.Node {
-	query := "SELECT * FROM main.columns"
+func (parser *ParserTable) MakeInformationSchemaColumnsNode(qSchemaTable QuerySchemaTable, permissions *map[string][]string, isDucklake bool) *pgQuery.Node {
+	// Filter out internal DuckLake catalog tables (ducklake_*)
+	var query string
+	if isDucklake {
+		// For DuckLake, map 'main' schema to 'public' for Postgres compatibility
+		query = "SELECT table_catalog, CASE WHEN table_schema = 'main' THEN 'public' ELSE table_schema END AS table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, character_octet_length, numeric_precision, numeric_precision_radix, numeric_scale, datetime_precision, interval_type, interval_precision, character_set_catalog, character_set_schema, character_set_name, collation_catalog, collation_schema, collation_name, domain_catalog, domain_schema, domain_name, udt_catalog, udt_schema, udt_name, scope_catalog, scope_schema, scope_name, maximum_cardinality, dtd_identifier, is_self_referencing, is_identity, identity_generation, identity_start, identity_increment, identity_maximum, identity_minimum, identity_cycle, is_generated, generation_expression, is_updatable FROM main.columns WHERE table_name NOT LIKE 'ducklake_%'"
+	} else {
+		query = "SELECT * FROM main.columns WHERE table_name NOT LIKE 'ducklake_%'"
+	}
 
 	if permissions != nil {
 		conditions := []string{}
@@ -97,7 +152,63 @@ func (parser *ParserTable) MakeInformationSchemaColumnsNode(qSchemaTable QuerySc
 			for _, columnName := range columnNames {
 				quotedColumnNames = append(quotedColumnNames, "'"+columnName+"'")
 			}
-			conditions = append(conditions, "(table_schema || '.' || table_name = '"+schemaTable+"' AND column_name IN ("+strings.Join(quotedColumnNames, ", ")+"))")
+			if isDucklake {
+				conditions = append(conditions, "((CASE WHEN table_schema = 'main' THEN 'public' ELSE table_schema END) || '.' || table_name = '"+schemaTable+"' AND column_name IN ("+strings.Join(quotedColumnNames, ", ")+"))")
+			} else {
+				conditions = append(conditions, "(table_schema || '.' || table_name = '"+schemaTable+"' AND column_name IN ("+strings.Join(quotedColumnNames, ", ")+"))")
+			}
+		}
+		query += " AND (" + strings.Join(conditions, " OR ") + ")"
+	}
+
+	return parser.makeSubselectNode(query, qSchemaTable)
+}
+
+// information_schema.table_constraints -> (SELECT * FROM main.table_constraints) information_schema_table_constraints
+func (parser *ParserTable) MakeInformationSchemaTableConstraintsNode(qSchemaTable QuerySchemaTable, permissions *map[string][]string, isDucklake bool) *pgQuery.Node {
+	query := "SELECT * FROM main." + PG_TABLE_TABLE_CONSTRAINTS
+
+	if permissions != nil && len(*permissions) > 0 {
+		conditions := []string{}
+		for schemaTable := range *permissions {
+			if isDucklake {
+				conditions = append(conditions, "((CASE WHEN table_schema = 'main' THEN 'public' ELSE table_schema END) || '.' || table_name = '"+schemaTable+"')")
+			} else {
+				conditions = append(conditions, "(table_schema || '.' || table_name = '"+schemaTable+"')")
+			}
+		}
+		query += " WHERE " + strings.Join(conditions, " OR ")
+	}
+
+	return parser.makeSubselectNode(query, qSchemaTable)
+}
+
+// information_schema.key_column_usage -> (SELECT * FROM main.key_column_usage) information_schema_key_column_usage
+func (parser *ParserTable) MakeInformationSchemaKeyColumnUsageNode(qSchemaTable QuerySchemaTable, permissions *map[string][]string, isDucklake bool) *pgQuery.Node {
+	query := "SELECT * FROM main." + PG_TABLE_KEY_COLUMN_USAGE
+
+	if permissions != nil && len(*permissions) > 0 {
+		conditions := []string{}
+		for schemaTable, columnNames := range *permissions {
+			var condition string
+			if len(columnNames) == 0 {
+				if isDucklake {
+					condition = "((CASE WHEN table_schema = 'main' THEN 'public' ELSE table_schema END) || '.' || table_name = '" + schemaTable + "')"
+				} else {
+					condition = "(table_schema || '.' || table_name = '" + schemaTable + "')"
+				}
+			} else {
+				quotedColumnNames := make([]string, len(columnNames))
+				for i, columnName := range columnNames {
+					quotedColumnNames[i] = "'" + columnName + "'"
+				}
+				if isDucklake {
+					condition = "((CASE WHEN table_schema = 'main' THEN 'public' ELSE table_schema END) || '.' || table_name = '" + schemaTable + "' AND column_name IN (" + strings.Join(quotedColumnNames, ", ") + "))"
+				} else {
+					condition = "(table_schema || '.' || table_name = '" + schemaTable + "' AND column_name IN (" + strings.Join(quotedColumnNames, ", ") + "))"
+				}
+			}
+			conditions = append(conditions, condition)
 		}
 		query += " WHERE " + strings.Join(conditions, " OR ")
 	}
@@ -186,4 +297,32 @@ func (parser *ParserTable) makeSubselectNode(query string, qSchemaTable QuerySch
 			},
 		},
 	}
+}
+
+// makeDirectTableNode creates a direct table reference without subquery wrapping
+// This allows DuckDB's query optimizer to push down LIMIT, WHERE, and column projections
+// quotedTablePath should be in format: "catalog"."schema"."table"
+func (parser *ParserTable) makeDirectTableNode(quotedTablePath string, qSchemaTable QuerySchemaTable) *pgQuery.Node {
+	// Parse a simple SELECT to extract the table reference
+	query := "SELECT * FROM " + quotedTablePath
+	queryTree, err := pgQuery.Parse(query)
+	common.PanicIfError(parser.config.CommonConfig, err)
+
+	// Extract the FROM clause RangeVar node
+	selectStmt := queryTree.Stmts[0].Stmt.GetSelectStmt()
+	tableNode := selectStmt.FromClause[0]
+
+	// Set the alias to match the original table name
+	rangeVar := tableNode.GetRangeVar()
+	alias := qSchemaTable.Alias
+	if alias == "" {
+		if qSchemaTable.Schema == PG_SCHEMA_PUBLIC || qSchemaTable.Schema == "" {
+			alias = qSchemaTable.Table
+		} else {
+			alias = qSchemaTable.Schema + "_" + qSchemaTable.Table
+		}
+	}
+	rangeVar.Alias = &pgQuery.Alias{Aliasname: alias}
+
+	return tableNode
 }
