@@ -46,42 +46,23 @@ func main() {
 	common.LogInfo(config.CommonConfig, "DuckDB: Connected")
 	defer duckdbClient.Close()
 
-	// Phase 2: Initialize DuckLake and build cache (for DuckLake mode)
-	var catalogCache *CatalogCache
-	var catalogCacheSQLite *CatalogCacheSQLite
+	// Phase 2: Initialize DuckLake (for DuckLake mode)
 	if config.CommonConfig.Ducklake.CatalogUrl != "" {
 		ctx := context.Background()
 		err := duckdbClient.InitializeDucklake(ctx)
 		common.PanicIfError(config.CommonConfig, err)
 		common.LogInfo(config.CommonConfig, "DuckLake: Initialized")
-
-		// Build catalog cache BEFORE creating pg_catalog tables
-		catalogCache = NewCatalogCache()
-		err = catalogCache.BuildCache(ctx, duckdbClient, config.CommonConfig.Ducklake.CatalogName, config.CommonConfig)
-		if err != nil {
-			common.LogWarn(config.CommonConfig, "Failed to build catalog cache:", err)
-		} else {
-			common.LogInfo(config.CommonConfig, "CatalogCache: Ready")
-		}
-
-		// Build in-memory SQLite cache for sub-second catalog queries
-		catalogCacheSQLite, err = NewCatalogCacheSQLite(catalogCache, config.CommonConfig)
-		if err != nil {
-			common.LogWarn(config.CommonConfig, "Failed to build SQLite catalog cache:", err)
-		} else {
-			common.LogInfo(config.CommonConfig, "CatalogCache: SQLite ready for fast queries")
-		}
 	}
 
-	// Phase 3: Create pg_catalog tables/views with populated cache
+	// Phase 3: Create pg_catalog tables/views
 	ctx := context.Background()
-	for _, query := range duckdbBootQueriesPhase2(config, catalogCache) {
+	for _, query := range duckdbBootQueriesPhase2(config) {
 		_, err := duckdbClient.ExecContext(ctx, query)
 		common.PanicIfError(config.CommonConfig, err)
 	}
 	common.LogInfo(config.CommonConfig, "pg_catalog: Initialized")
 
-	queryHandler := NewQueryHandler(config, duckdbClient, catalogCache, catalogCacheSQLite)
+	queryHandler := NewQueryHandler(config, duckdbClient)
 
 	// Connection limiting to prevent resource exhaustion
 	connectionSemaphore := make(chan struct{}, config.MaxConnections)
@@ -135,15 +116,15 @@ func duckdbBootQueriesPhase1(config *Config) []string {
 	)
 }
 
-// Phase 2: pg_catalog setup (after cache is built)
-func duckdbBootQueriesPhase2(config *Config, catalogCache *CatalogCache) []string {
+// Phase 2: pg_catalog setup
+func duckdbBootQueriesPhase2(config *Config) []string {
 	return slices.Concat(
 		// Create pg-compatible functions
 		CreatePgCatalogMacroQueries(config),
 		CreateInformationSchemaMacroQueries(config),
 
-		// Create pg-compatible tables and views (with populated cache)
-		CreatePgCatalogTableQueries(config, catalogCache),
+		// Create pg-compatible tables and views
+		CreatePgCatalogTableQueries(config, nil),
 		CreateInformationSchemaTableQueries(config),
 
 		// Use the public schema
