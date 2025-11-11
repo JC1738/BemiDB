@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	pgQuery "github.com/pganalyze/pg_query_go/v6"
 
@@ -22,18 +24,23 @@ type QueryRemapperTable struct {
 	IcebergMaterializedViews      []common.IcebergMaterializedView
 	icebergReader                 *IcebergReader
 	ServerDuckdbClient            *common.DuckdbClient // nilable
+	catalogCache                  *CatalogCache        // Cache for pg_catalog metadata
 	config                        *Config
+	lastDucklakeTablesReload      time.Time   // Last time DuckLake tables were reloaded
+	ducklakeTablesReloadMu        sync.Mutex  // Mutex to protect lastDucklakeTablesReload
 }
 
-func NewQueryRemapperTable(config *Config, icebergReader *IcebergReader, serverDuckdbClient *common.DuckdbClient) *QueryRemapperTable {
+func NewQueryRemapperTable(config *Config, icebergReader *IcebergReader, serverDuckdbClient *common.DuckdbClient, catalogCache *CatalogCache) *QueryRemapperTable {
 	remapper := &QueryRemapperTable{
 		parserTable:        NewParserTable(config),
 		parserFunction:     NewParserFunction(config),
 		remapperFunction:   NewQueryRemapperFunction(config, icebergReader),
 		icebergReader:      icebergReader,
 		ServerDuckdbClient: serverDuckdbClient,
+		catalogCache:       catalogCache, // Use cache passed from main.go
 		config:             config,
 	}
+
 	remapper.reloadIcebergTables()
 	return remapper
 }
@@ -227,6 +234,19 @@ func (remapper *QueryRemapperTable) reloadIcebergPersistentTables() {
 }
 
 func (remapper *QueryRemapperTable) reloadDucklakeTables() {
+	// Cache table list for 15 minutes to avoid excessive Neon catalog queries
+	// This prevents SSL connection timeouts during long Metabase syncs
+	remapper.ducklakeTablesReloadMu.Lock()
+	timeSinceLastReload := time.Since(remapper.lastDucklakeTablesReload)
+	hasTablesLoaded := len(remapper.IcebergPersistentSchemaTables) > 0
+	remapper.ducklakeTablesReloadMu.Unlock()
+
+	// Use cached data if less than 15 minutes old and we have tables
+	if timeSinceLastReload < 15*time.Minute && hasTablesLoaded {
+		common.LogDebug(remapper.config.CommonConfig, fmt.Sprintf("DuckLake: Using cached table list (%d tables, age: %.1f minutes)", len(remapper.IcebergPersistentSchemaTables), timeSinceLastReload.Minutes()))
+		return
+	}
+
 	ctx := context.Background()
 
 	// Query DuckLake catalog for available tables using duckdb_tables() function
@@ -240,6 +260,7 @@ func (remapper *QueryRemapperTable) reloadDucklakeTables() {
 		  AND t.table_name NOT LIKE 'ducklake_%%'
 	`, catalogName)
 
+	common.LogDebug(remapper.config.CommonConfig, "DuckLake: Reloading tables from Neon catalog...")
 	rows, err := remapper.ServerDuckdbClient.QueryContext(ctx, query)
 	common.PanicIfError(remapper.config.CommonConfig, err)
 	defer rows.Close()
@@ -265,7 +286,20 @@ func (remapper *QueryRemapperTable) reloadDucklakeTables() {
 
 	remapper.IcebergPersistentSchemaTables = newIcebergSchemaTables
 
+	// Update last reload timestamp
+	remapper.ducklakeTablesReloadMu.Lock()
+	remapper.lastDucklakeTablesReload = time.Now()
+	remapper.ducklakeTablesReloadMu.Unlock()
+
 	common.LogInfo(remapper.config.CommonConfig, fmt.Sprintf("DuckLake: Loaded %d tables from catalog", len(newIcebergSchemaTables)))
+
+	// Build catalog cache ONCE on first access (don't rebuild on every query!)
+	// The cache doesn't change during operation, so only build if it's empty
+	if remapper.catalogCache != nil && remapper.ServerDuckdbClient != nil && len(remapper.catalogCache.Tables) == 0 {
+		if err := remapper.catalogCache.BuildCache(ctx, remapper.ServerDuckdbClient, catalogName, remapper.config.CommonConfig); err != nil {
+			common.LogWarn(remapper.config.CommonConfig, "Failed to build catalog cache:", err)
+		}
+	}
 }
 
 func (remapper *QueryRemapperTable) reloadIcebergMaterializedViews() {
@@ -406,11 +440,14 @@ func getDuckDBTypeToPostgresOidCaseExpression(dataTypeColumn string) string {
 	END`
 }
 
-func CreatePgCatalogTableQueries(config *Config) []string {
+func CreatePgCatalogTableQueries(config *Config, catalogCache *CatalogCache) []string {
 	result := []string{
 		// Static empty tables
 		"CREATE TABLE pg_inherits(inhrelid oid, inhparent oid, inhseqno int4, inhdetachpending bool)",
 		"CREATE TABLE pg_shdescription(objoid oid, classoid oid, description text)",
+		// Empty tables to redirect slow pg_catalog queries (LEFT JOINs will return NULL quickly)
+		"CREATE TABLE pg_attrdef(oid oid, adrelid oid, adnum int2, adbin text)",
+		"CREATE TABLE pg_description(objoid oid, classoid oid, objsubid int4, description text)",
 		"CREATE TABLE pg_statio_user_tables(relid oid, schemaname text, relname text, heap_blks_read int8, heap_blks_hit int8, idx_blks_read int8, idx_blks_hit int8, toast_blks_read int8, toast_blks_hit int8, tidx_blks_read int8, tidx_blks_hit int8)",
 		"CREATE TABLE pg_replication_slots(slot_name text, plugin text, slot_type text, datoid oid, database text, temporary bool, active bool, active_pid int4, xmin int8, catalog_xmin int8, restart_lsn text, confirmed_flush_lsn text, wal_status text, safe_wal_size int8, two_phase bool, conflicting bool)",
 		"CREATE TABLE pg_stat_gssapi(pid int4, gss_authenticated bool, principal text, encrypted bool, credentials_delegated bool)",
@@ -525,11 +562,22 @@ func CreatePgCatalogTableQueries(config *Config) []string {
 		JOIN duckdb_tables() t ON d.database_oid = t.database_oid
 		WHERE d.database_name = '` + config.CommonConfig.Ducklake.CatalogName + `'
 		  AND t.table_name NOT LIKE 'ducklake_%%'
-		  AND EXISTS (
-		      SELECT 1 FROM duckdb_columns() c
-		      WHERE c.table_oid = t.table_oid
-		      AND c.column_name = 'id'
-		      AND NOT c.internal
+		  AND (
+		      -- Priority 1: Has an 'id' column
+		      EXISTS (
+		          SELECT 1 FROM duckdb_columns() c
+		          WHERE c.table_oid = t.table_oid
+		          AND c.column_name = 'id'
+		          AND NOT c.internal
+		      )
+		      OR
+		      -- Priority 2: Has a column ending with '_id' (e.g., airtable_id, user_id)
+		      EXISTS (
+		          SELECT 1 FROM duckdb_columns() c
+		          WHERE c.table_oid = t.table_oid
+		          AND c.column_name ~ '.*_id$'
+		          AND NOT c.internal
+		      )
 		  )`,
 		`CREATE VIEW pg_type AS
 			SELECT * FROM pg_catalog.pg_type
@@ -896,6 +944,16 @@ func CreatePgCatalogTableQueries(config *Config) []string {
 			UNION ALL
 			SELECT 6157, '_int8multirange', (SELECT typnamespace FROM pg_catalog.pg_type WHERE typname = 'bool'), 0, -1, false, 'b', 'A', false, true, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'd', 'p', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 		`,
+		// Materialize pg_type VIEW into TABLE for sub-second JOIN performance
+		// The VIEW with 100+ UNION ALL adds ~1.5s to queries, TABLE is instant
+		"CREATE TABLE pg_type_materialized AS SELECT * FROM pg_type",
+		"DROP VIEW pg_type",
+		"ALTER TABLE pg_type_materialized RENAME TO pg_type",
+
+		// Create indexes for fast catalog query performance
+		"CREATE INDEX idx_pg_type_oid ON main.pg_type(oid)",
+		"CREATE INDEX idx_pg_attrdef_adrelid_adnum ON main.pg_attrdef(adrelid, adnum)",
+		"CREATE INDEX idx_pg_description_objoid_objsubid ON main.pg_description(objoid, objsubid)",
 	}
 
 	// Add pg_attribute view for DuckLake tables if DuckLake is configured
@@ -972,46 +1030,156 @@ func CreatePgCatalogTableQueries(config *Config) []string {
 
 		result = append(result, pgTablesView)
 
-		// Add pg_index entries for primary keys (tables with 'id' column)
-		// This is needed for Metabase and other BI tools to discover primary keys
-		pgIndexView := `CREATE VIEW pg_index AS
-		SELECT *, FALSE AS indnullsnotdistinct FROM (
-		SELECT * FROM pg_catalog.pg_index
-		UNION ALL
-		SELECT
-			(hash(t.table_name || '_pkey') % 2147483647)::BIGINT AS indexrelid,
-			(hash(t.table_name) % 2147483647)::BIGINT AS indrelid,
-			1 AS indnatts,
-			1 AS indnkeyatts,
-			TRUE AS indisunique,
-			TRUE AS indisprimary,
-			FALSE AS indisexclusion,
-			TRUE AS indimmediate,
-			FALSE AS indisclustered,
-			TRUE AS indisvalid,
-			FALSE AS indcheckxmin,
-			TRUE AS indisready,
-			TRUE AS indislive,
-			FALSE AS indisreplident,
-			ARRAY[1::INT2] AS indkey,
-			ARRAY[]::BIGINT[] AS indcollation,
-			ARRAY[]::BIGINT[] AS indclass,
-			ARRAY[]::INTEGER[] AS indoption,
-			NULL AS indexprs,
-			NULL::INTEGER AS indpred
-		FROM duckdb_databases() d
-		JOIN duckdb_tables() t ON d.database_oid = t.database_oid
-		WHERE d.database_name = '` + catalogName + `'
-		  AND t.table_name NOT LIKE 'ducklake_%%'
-		  AND EXISTS (
-		      SELECT 1 FROM duckdb_columns() c
-		      WHERE c.table_oid = t.table_oid
-		      AND c.column_name = 'id'
-		      AND NOT c.internal
-		  )
-		)`
+		// If cache is available, replace pg_class and pg_attribute VIEWs with cached TABLEs
+		// This avoids expensive duckdb_tables()/duckdb_columns() queries with EXISTS subqueries
+		if catalogCache != nil {
+			// Drop and recreate pg_class as TABLE with cached data
+			result = append(result, "DROP VIEW IF EXISTS pg_class CASCADE")
 
-		result = append(result, pgIndexView)
+			pgClassTable := `CREATE TABLE pg_class (
+				oid BIGINT,
+				relname VARCHAR,
+				relnamespace BIGINT,
+				reltype BIGINT,
+				reloftype BIGINT,
+				relowner BIGINT,
+				relam BIGINT,
+				relfilenode BIGINT,
+				reltablespace BIGINT,
+				relpages INT,
+				reltuples FLOAT,
+				relallvisible INT,
+				reltoastrelid BIGINT,
+				relhasindex BOOLEAN,
+				relisshared BOOLEAN,
+				relpersistence CHAR(1),
+				relkind CHAR(1),
+				relforcerowsecurity BOOLEAN
+			)`
+			result = append(result, pgClassTable)
+
+			// Get public namespace OID
+			publicNamespaceOID := int64(2035) // DuckDB uses 2035, not standard Postgres 2200
+
+			// Insert table entries from cache
+			for _, table := range catalogCache.GetAllTables() {
+				insertStmt := fmt.Sprintf(`
+					INSERT INTO pg_class VALUES (
+						%d, '%s', %d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+						FALSE, FALSE, 'p', 'r', FALSE
+					)`, table.OID, table.Name, publicNamespaceOID)
+				result = append(result, insertStmt)
+			}
+
+			// Insert primary key index entries from cache
+			for _, pk := range catalogCache.GetAllPrimaryKeys() {
+				insertStmt := fmt.Sprintf(`
+					INSERT INTO pg_class VALUES (
+						%d, '%s', %d, 0, 0, 0, 403, 0, 0, 0, 0, 0, 0,
+						FALSE, FALSE, 'p', 'i', FALSE
+					)`, pk.OID, pk.ConstraintName, publicNamespaceOID)
+				result = append(result, insertStmt)
+			}
+
+			// Drop and recreate pg_attribute as TABLE with cached data
+			result = append(result, "DROP VIEW IF EXISTS pg_attribute CASCADE")
+
+			pgAttributeTable := `CREATE TABLE pg_attribute (
+				attrelid BIGINT,
+				attname VARCHAR,
+				atttypid BIGINT,
+				attstattarget INT,
+				attlen INT,
+				attnum INT,
+				attndims INT,
+				attcacheoff INT,
+				atttypmod INT,
+				attbyval BOOLEAN,
+				attstorage CHAR(1),
+				attalign CHAR(1),
+				attnotnull BOOLEAN,
+				atthasdef BOOLEAN,
+				atthasmissing BOOLEAN,
+				attidentity CHAR(1),
+				attgenerated CHAR(1),
+				attisdropped BOOLEAN,
+				attislocal BOOLEAN,
+				attinhcount INT,
+				attcollation BIGINT,
+				attcompression VARCHAR,
+				attacl VARCHAR,
+				attoptions VARCHAR,
+				attfdwoptions VARCHAR,
+				attmissingval VARCHAR
+			)`
+			result = append(result, pgAttributeTable)
+
+			// Insert column entries from cache
+			for tableName, columns := range catalogCache.GetAllColumns() {
+				tableOID, ok := catalogCache.GetTableOID(tableName)
+				if !ok {
+					continue
+				}
+				for _, col := range columns {
+					// Default type OID (text=25)
+					typeOID := int64(25)
+					insertStmt := fmt.Sprintf(`
+						INSERT INTO pg_attribute VALUES (
+							%d, '%s', %d, -1, -1, %d, 0, -1, -1,
+							FALSE, 'p', 'i', FALSE, FALSE, FALSE, '', '',
+							FALSE, TRUE, 0, 0, NULL, NULL, NULL, NULL, NULL
+						)`, tableOID, col.Name, typeOID, col.Index)
+					result = append(result, insertStmt)
+				}
+			}
+
+		}
+
+		// Create pg_index table for primary key metadata
+		// Pre-populated from cache to avoid expensive queries on every Metabase sync
+		pgIndexTable := `CREATE TABLE pg_index (
+			indexrelid BIGINT,
+			indrelid BIGINT,
+			indnatts INT,
+			indnkeyatts INT,
+			indisunique BOOLEAN,
+			indisprimary BOOLEAN,
+			indisexclusion BOOLEAN,
+			indimmediate BOOLEAN,
+			indisclustered BOOLEAN,
+			indisvalid BOOLEAN,
+			indcheckxmin BOOLEAN,
+			indisready BOOLEAN,
+			indislive BOOLEAN,
+			indisreplident BOOLEAN,
+			indkey INT2[],
+			indcollation BIGINT[],
+			indclass BIGINT[],
+			indoption INTEGER[],
+			indexprs INTEGER,
+			indpred INTEGER,
+			indnullsnotdistinct BOOLEAN
+		)`
+		result = append(result, pgIndexTable)
+
+		// Populate pg_index from cache
+		if catalogCache != nil {
+			for _, pk := range catalogCache.PrimaryKeys {
+				indexOID := hashString(pk.TableName + "_pkey")
+				insertStmt := fmt.Sprintf(`
+					INSERT INTO pg_index VALUES (
+						%d, %d, 1, 1,
+						TRUE, TRUE, FALSE, TRUE, FALSE, TRUE, FALSE, TRUE, TRUE, FALSE,
+						ARRAY[1::INT2], ARRAY[]::BIGINT[], ARRAY[]::BIGINT[], ARRAY[]::INTEGER[],
+						NULL, NULL, FALSE
+					)`, indexOID, pk.TableOID)
+				result = append(result, insertStmt)
+			}
+		}
+
+		// Add indexes for fast JOIN performance
+		result = append(result, "CREATE INDEX idx_pg_index_indrelid ON main.pg_index(indrelid)")
+		result = append(result, "CREATE INDEX idx_pg_index_indexrelid ON main.pg_index(indexrelid)")
 
 		// Add pg_indexes view for Metabase compatibility
 		pgIndexesView := `CREATE VIEW pg_indexes AS
@@ -1029,55 +1197,58 @@ func CreatePgCatalogTableQueries(config *Config) []string {
 
 		result = append(result, pgIndexesView)
 
-		// Add pg_constraint view for Metabase compatibility
-		// Metabase queries pg_constraint to discover primary keys
-		pgConstraintView := `CREATE VIEW pg_constraint AS
-		SELECT
-			oid, conname, connamespace, contype, condeferrable, condeferred, convalidated,
-			conrelid, contypid, conindid, conparentid, confrelid, confupdtype, confdeltype, confmatchtype,
-			conislocal, coninhcount, connoinherit, conkey, confkey, conpfeqop, conppeqop, conffeqop,
-			ARRAY[]::INTEGER[] AS confdelsetcols, conexclop, conbin
-		FROM pg_catalog.pg_constraint
-		UNION ALL
-		SELECT
-			(hash(t.table_name || '_pkey') % 2147483647)::BIGINT AS oid,
-			t.table_name || '_pkey' AS conname,
-			(SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'public') AS connamespace,
-			'p' AS contype,
-			FALSE AS condeferrable,
-			FALSE AS condeferred,
-			TRUE AS convalidated,
-			(hash(t.table_name) % 2147483647)::BIGINT AS conrelid,
-			0::INTEGER AS contypid,
-			(hash(t.table_name || '_pkey') % 2147483647)::INTEGER AS conindid,
-			0::INTEGER AS conparentid,
-			0::INTEGER AS confrelid,
-			0::INTEGER AS confupdtype,
-			0::INTEGER AS confdeltype,
-			0::INTEGER AS confmatchtype,
-			TRUE AS conislocal,
-			0 AS coninhcount,
-			FALSE AS connoinherit,
-			ARRAY[1::BIGINT] AS conkey,
-			ARRAY[]::INTEGER[] AS confkey,
-			ARRAY[]::INTEGER[] AS conpfeqop,
-			ARRAY[]::INTEGER[] AS conppeqop,
-			ARRAY[]::INTEGER[] AS conffeqop,
-			ARRAY[]::INTEGER[] AS confdelsetcols,
-			ARRAY[]::INTEGER[] AS conexclop,
-			NULL AS conbin
-		FROM duckdb_databases() d
-		JOIN duckdb_tables() t ON d.database_oid = t.database_oid
-		WHERE d.database_name = '` + catalogName + `'
-		  AND t.table_name NOT LIKE 'ducklake_%%'
-		  AND EXISTS (
-		      SELECT 1 FROM duckdb_columns() c
-		      WHERE c.table_oid = t.table_oid
-		      AND c.column_name = 'id'
-		      AND NOT c.internal
-		  )`
+		// Create pg_constraint table for primary key constraints
+		// Pre-populated from cache to avoid expensive queries on every Metabase sync
+		pgConstraintTable := `CREATE TABLE pg_constraint (
+			oid BIGINT,
+			conname VARCHAR,
+			connamespace BIGINT,
+			contype CHAR(1),
+			condeferrable BOOLEAN,
+			condeferred BOOLEAN,
+			convalidated BOOLEAN,
+			conrelid BIGINT,
+			contypid INTEGER,
+			conindid INTEGER,
+			conparentid INTEGER,
+			confrelid INTEGER,
+			confupdtype INTEGER,
+			confdeltype INTEGER,
+			confmatchtype INTEGER,
+			conislocal BOOLEAN,
+			coninhcount INTEGER,
+			connoinherit BOOLEAN,
+			conkey BIGINT[],
+			confkey INTEGER[],
+			conpfeqop INTEGER[],
+			conppeqop INTEGER[],
+			conffeqop INTEGER[],
+			confdelsetcols INTEGER[],
+			conexclop INTEGER[],
+			conbin VARCHAR
+		)`
+		result = append(result, pgConstraintTable)
 
-		result = append(result, pgConstraintView)
+		// Get namespace OID for 'public' schema
+		// We'll use a static value since we control the schema creation
+		publicNamespaceOID := int64(2035) // DuckDB uses 2035, not standard Postgres 2200
+
+		// Populate pg_constraint from cache
+		if catalogCache != nil {
+			for _, pk := range catalogCache.PrimaryKeys {
+				insertStmt := fmt.Sprintf(`
+					INSERT INTO pg_constraint VALUES (
+						%d, '%s', %d, 'p',
+						FALSE, FALSE, TRUE,
+						%d, 0, %d, 0, 0, 0, 0, 0,
+						TRUE, 0, FALSE,
+						ARRAY[1::BIGINT], ARRAY[]::INTEGER[], ARRAY[]::INTEGER[], ARRAY[]::INTEGER[],
+						ARRAY[]::INTEGER[], ARRAY[]::INTEGER[], ARRAY[]::INTEGER[],
+						NULL
+					)`, pk.OID, pk.ConstraintName, publicNamespaceOID, pk.TableOID, hashString(pk.TableName+"_pkey"))
+				result = append(result, insertStmt)
+			}
+		}
 	} else {
 		// For non-DuckLake setups, use standard pg_index view
 		// DuckDB does not support indnullsnotdistinct column
