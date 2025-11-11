@@ -332,6 +332,8 @@ func (queryHandler *QueryHandler) rowsToDataMessages(rows *sql.Rows, originalQue
 		commandTag = "BEGIN"
 	case strings.HasPrefix(upperOriginalQueryStatement, "COMMIT"):
 		commandTag = "COMMIT"
+	case strings.HasPrefix(upperOriginalQueryStatement, "ROLLBACK"):
+		commandTag = "ROLLBACK"
 	case strings.HasPrefix(upperOriginalQueryStatement, "CREATE MATERIALIZED VIEW "):
 		commandTag = "CREATE MATERIALIZED VIEW"
 	case strings.HasPrefix(upperOriginalQueryStatement, "DROP MATERIALIZED VIEW "):
