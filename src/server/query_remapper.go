@@ -44,9 +44,9 @@ type QueryRemapper struct {
 	config             *Config
 }
 
-func NewQueryRemapper(config *Config, icebergReader *IcebergReader, icebergWriter *IcebergWriter, serverDuckdbClient *common.DuckdbClient, catalogCache *CatalogCache) *QueryRemapper {
+func NewQueryRemapper(config *Config, icebergReader *IcebergReader, icebergWriter *IcebergWriter, serverDuckdbClient *common.DuckdbClient, catalogCache interface{}) *QueryRemapper {
 	return &QueryRemapper{
-		remapperTable:      NewQueryRemapperTable(config, icebergReader, serverDuckdbClient, catalogCache),
+		remapperTable:      NewQueryRemapperTable(config, icebergReader, serverDuckdbClient, nil),
 		remapperExpression: NewQueryRemapperExpression(config),
 		remapperFunction:   NewQueryRemapperFunction(config, icebergReader),
 		remapperSelect:     NewQueryRemapperSelect(config),
