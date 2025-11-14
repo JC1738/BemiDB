@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 
@@ -207,12 +208,22 @@ func (server *PostgresServer) writeMessages(messages ...pgproto3.Message) {
 }
 
 func (server *PostgresServer) writeError(err error) {
-	common.LogError(server.config.CommonConfig, err.Error())
+	errorMsg := err.Error()
+
+	// Suppress harmless ROLLBACK errors from database/sql cleanup
+	// BemiDB is read-only and runs in autocommit mode, so ROLLBACK during
+	// connection cleanup is expected and harmless
+	if strings.Contains(errorMsg, "ROLLBACK") {
+		common.LogDebug(server.config.CommonConfig, "Suppressed harmless ROLLBACK error during cleanup:", errorMsg)
+		return
+	}
+
+	common.LogError(server.config.CommonConfig, errorMsg)
 
 	server.writeMessages(
 		&pgproto3.ErrorResponse{
 			Severity: "ERROR",
-			Message:  err.Error(),
+			Message:  errorMsg,
 		},
 		&pgproto3.ReadyForQuery{TxStatus: PG_TX_STATUS_IDLE},
 	)
