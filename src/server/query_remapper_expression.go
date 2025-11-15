@@ -1,8 +1,6 @@
 package main
 
 import (
-	"strings"
-
 	pgQuery "github.com/pganalyze/pg_query_go/v6"
 )
 
@@ -48,9 +46,8 @@ func (remapper *QueryRemapperExpression) remappedTypeCast(node *pgQuery.Node) *p
 		// '{a,b,c}'::text[] -> ARRAY['a', 'b', 'c']
 		return remapper.parserTypeCast.MakeListValueFromArray(typeCast.Arg)
 	case "regproc":
-		// 'schema.function_name'::regproc -> 'function_name'
-		nameParts := strings.Split(remapper.parserTypeCast.ArgStringValue(typeCast), ".")
-		return pgQuery.MakeAConstStrNode(nameParts[len(nameParts)-1], 0)
+		// 'schema.function'::regproc -> SELECT p.oid FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'schema' AND p.proname = 'function'
+		return remapper.parserTypeCast.MakeSubselectOidBySchemaFunctionArg(typeCast.Arg)
 	case "regclass":
 		// 'schema.table'::regclass -> SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'schema' AND c.relname = 'table'
 		return remapper.parserTypeCast.MakeSubselectOidBySchemaTableArg(typeCast.Arg)
