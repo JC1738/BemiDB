@@ -23,15 +23,17 @@ func main() {
 	config := LoadConfig()
 	defer common.HandleUnexpectedPanic(config.CommonConfig)
 
-	// Debug: Verify configuration loading
+	// Debug: Verify configuration loading without leaking credentials
 	common.LogDebug(config.CommonConfig, "=== Configuration Debug ===")
-	common.LogDebug(config.CommonConfig, fmt.Sprintf("DuckLake.CatalogUrl: '%s'", config.CommonConfig.Ducklake.CatalogUrl))
-	common.LogDebug(config.CommonConfig, fmt.Sprintf("DuckLake.CatalogName: '%s'", config.CommonConfig.Ducklake.CatalogName))
-	common.LogDebug(config.CommonConfig, fmt.Sprintf("DuckLake.DataPath: '%s'", config.CommonConfig.Ducklake.DataPath))
-	common.LogDebug(config.CommonConfig, fmt.Sprintf("R2.AccountId: '%s'", config.CommonConfig.R2.AccountId))
+	common.LogDebug(config.CommonConfig, fmt.Sprintf("DuckLake configured: %t", config.CommonConfig.Ducklake.CatalogUrl != ""))
+	if config.CommonConfig.Ducklake.CatalogUrl != "" {
+		common.LogDebug(config.CommonConfig, fmt.Sprintf("DuckLake catalog name: '%s'", config.CommonConfig.Ducklake.CatalogName))
+		common.LogDebug(config.CommonConfig, fmt.Sprintf("DuckLake data path configured: %t", config.CommonConfig.Ducklake.DataPath != ""))
+		common.LogDebug(config.CommonConfig, fmt.Sprintf("R2 account configured: %t", config.CommonConfig.R2.AccountId != ""))
+	}
+	common.LogDebug(config.CommonConfig, fmt.Sprintf("CatalogDatabaseUrl configured: %t", config.CommonConfig.CatalogDatabaseUrl != ""))
 	common.LogDebug(config.CommonConfig, "R2.AccessKeyId: [REDACTED]")
 	common.LogDebug(config.CommonConfig, "R2.SecretAccessKey: [REDACTED]")
-	common.LogDebug(config.CommonConfig, fmt.Sprintf("CatalogDatabaseUrl: '%s'", config.CommonConfig.CatalogDatabaseUrl))
 	common.LogDebug(config.CommonConfig, "=== End Configuration ===")
 
 	if config.CommonConfig.LogLevel == common.LOG_LEVEL_TRACE {

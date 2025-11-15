@@ -29,7 +29,7 @@ case "${1:-server}" in
     echo "Starting BemiDB server with DuckLake integration..."
     echo "  Catalog: $DUCKLAKE_CATALOG_NAME"
     echo "  Data path: $DUCKLAKE_DATA_PATH"
-    echo "  Port: ${BEMIDB_PORT:-54321}"
+    echo "  Port: ${BEMIDB_PORT:-15432}"
     echo "  Database: ${BEMIDB_DATABASE:-bemidb}"
     echo ""
 

@@ -114,10 +114,13 @@ func (server *PostgresServer) handleExtendedQuery(queryHandler *QueryHandler, pa
 	}
 	server.writeMessages(messages...)
 
-	// Ensure prepared statement is closed when this function exits
+	// Ensure prepared statement resources are closed when this function exits
 	defer func() {
-		if preparedStatement != nil && preparedStatement.Statement != nil {
-			preparedStatement.Statement.Close()
+		if preparedStatement != nil {
+			preparedStatement.releaseResources()
+			if preparedStatement.Statement != nil {
+				preparedStatement.Statement.Close()
+			}
 		}
 	}()
 
@@ -191,6 +194,7 @@ func (server *PostgresServer) handleExtendedQuery(queryHandler *QueryHandler, pa
 				preparedStatement.Statement.Close()
 				preparedStatement.Statement = nil // Prevent double-close in defer
 			}
+			preparedStatement.releaseResources()
 			server.writeMessages(&pgproto3.CloseComplete{})
 		default:
 			common.LogError(server.config.CommonConfig, fmt.Sprintf("Received unexpected message type from client: %T", message))

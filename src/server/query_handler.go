@@ -48,6 +48,21 @@ type PreparedStatement struct {
 	CancelContext context.CancelFunc
 }
 
+// releaseResources cleans up any open rows/contexts tied to the prepared statement.
+func (preparedStatement *PreparedStatement) releaseResources() {
+	if preparedStatement == nil {
+		return
+	}
+	if preparedStatement.Rows != nil {
+		preparedStatement.Rows.Close()
+		preparedStatement.Rows = nil
+	}
+	if preparedStatement.CancelContext != nil {
+		preparedStatement.CancelContext()
+		preparedStatement.CancelContext = nil
+	}
+}
+
 func NewQueryHandler(config *Config, serverDuckdbClient *common.DuckdbClient) *QueryHandler {
 	storageS3 := common.NewStorageS3(config.CommonConfig)
 
@@ -235,14 +250,14 @@ func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe
 
 	rows, err := preparedStatement.Statement.QueryContext(ctx, preparedStatement.Variables...)
 	if err != nil {
-		cancel() // Clean up context on error
+		preparedStatement.releaseResources()
 		return nil, nil, fmt.Errorf("couldn't execute statement: %w. Original query: %s", err, preparedStatement.OriginalQuery)
 	}
 	preparedStatement.Rows = rows
 
 	messages, err := queryHandler.rowsToDescriptionMessages(preparedStatement.Rows, preparedStatement.OriginalQuery)
 	if err != nil {
-		cancel() // Clean up context on error
+		preparedStatement.releaseResources()
 		return nil, nil, err
 	}
 	return messages, preparedStatement, nil
@@ -264,17 +279,13 @@ func (queryHandler *QueryHandler) HandleExecuteQuery(message *pgproto3.Execute, 
 
 		rows, err := preparedStatement.Statement.QueryContext(ctx, preparedStatement.Variables...)
 		if err != nil {
-			cancel() // Clean up context on error
+			preparedStatement.releaseResources()
 			return nil, err
 		}
 		preparedStatement.Rows = rows
 	}
 
-	defer preparedStatement.Rows.Close()
-	// Clean up context after rows are consumed (if context was created)
-	if preparedStatement.CancelContext != nil {
-		defer preparedStatement.CancelContext()
-	}
+	defer preparedStatement.releaseResources()
 
 	return queryHandler.rowsToDataMessages(preparedStatement.Rows, preparedStatement.OriginalQuery)
 }
