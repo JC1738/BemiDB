@@ -11,6 +11,7 @@
 bemidb
 /src/__debug*
 /bin
+/src/server/server
 
 # Server management scripts
 test-ducklake.sh

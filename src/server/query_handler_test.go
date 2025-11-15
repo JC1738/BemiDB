@@ -1910,14 +1910,13 @@ SET standard_conforming_strings = on;`
 
 func initQueryHandler() *QueryHandler {
 	config := loadTestConfig()
-	// For tests, use Phase 1 queries only (Phase 2 requires cache which is nil in tests)
+	// Initialize DuckDB schemas/functions for tests
 	serverDuckdbClient := common.NewDuckdbClient(config.CommonConfig, duckdbBootQueriesPhase1(config))
-	// Execute Phase 2 queries with nil cache (will create empty pg_catalog tables)
 	ctx := context.Background()
-	for _, query := range duckdbBootQueriesPhase2(config, nil) {
+	for _, query := range duckdbBootQueriesPhase2(config) {
 		_, _ = serverDuckdbClient.ExecContext(ctx, query)
 	}
-	return NewQueryHandler(config, serverDuckdbClient, nil)
+	return NewQueryHandler(config, serverDuckdbClient)
 }
 
 func loadTestConfig() *Config {

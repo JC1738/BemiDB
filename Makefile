@@ -67,7 +67,7 @@ docker-sh-ducklake:
 
 docker-test-ducklake: docker-build-ducklake
 	@echo "Testing DuckLake Docker image..."
-	@docker run --rm --env-file .env.ducklake -p 15432:54321 -d --name bemidb-ducklake-test bemidb-ducklake:latest
+	@docker run --rm --env-file .env.ducklake -p 15432:15432 -d --name bemidb-ducklake-test bemidb-ducklake:latest
 	@sleep 5
 	@echo "Attempting connection..."
 	@psql "host=localhost port=15432 user=postgres dbname=bemidb" -c "SELECT 'Docker test successful!' AS status" || (docker stop bemidb-ducklake-test && exit 1)

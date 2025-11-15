@@ -58,6 +58,9 @@ func NewQueryRemapper(config *Config, icebergReader *IcebergReader, icebergWrite
 }
 
 func (remapper *QueryRemapper) ParseAndRemapQuery(query string) ([]string, []string, error) {
+	// Extract long identifiers from original query string BEFORE parsing
+	identifierMap := ExtractLongIdentifiersFromQuery(query)
+
 	queryTree, err := pgQuery.Parse(query)
 	if err != nil {
 		return nil, nil, fmt.Errorf("couldn't parse query: %s. %w", query, err)
@@ -78,7 +81,7 @@ func (remapper *QueryRemapper) ParseAndRemapQuery(query string) ([]string, []str
 
 	var originalQueryStatements []string
 	for _, stmt := range queryTree.Stmts {
-		originalQueryStatement, err := pgQuery.Deparse(&pgQuery.ParseResult{Stmts: []*pgQuery.RawStmt{stmt}})
+		originalQueryStatement, err := DeparseWithLongIdentifiers(&pgQuery.ParseResult{Stmts: []*pgQuery.RawStmt{stmt}}, identifierMap)
 		if err != nil {
 			return nil, nil, fmt.Errorf("couldn't deparse query: %s. %w", query, err)
 		}
@@ -92,7 +95,7 @@ func (remapper *QueryRemapper) ParseAndRemapQuery(query string) ([]string, []str
 
 	var queryStatements []string
 	for _, remappedStatement := range remappedStatements {
-		queryStatement, err := pgQuery.Deparse(&pgQuery.ParseResult{Stmts: []*pgQuery.RawStmt{remappedStatement}})
+		queryStatement, err := DeparseWithLongIdentifiers(&pgQuery.ParseResult{Stmts: []*pgQuery.RawStmt{remappedStatement}}, identifierMap)
 		if err != nil {
 			return nil, nil, fmt.Errorf("couldn't deparse remapped query: %s. %w", query, err)
 		}
@@ -583,7 +586,8 @@ func (remapper *QueryRemapper) createMaterializedView(node *pgQuery.Node) error 
 	// Extract the definition of the materialized view
 	definitionSelectStmt := node.GetCreateTableAsStmt().Query.GetSelectStmt()
 	definitionRawStmt := &pgQuery.RawStmt{Stmt: &pgQuery.Node{Node: &pgQuery.Node_SelectStmt{SelectStmt: definitionSelectStmt}}}
-	definition, err := pgQuery.Deparse(&pgQuery.ParseResult{Stmts: []*pgQuery.RawStmt{definitionRawStmt}})
+	// Note: For materialized views, we don't have the original query string, so pass empty map
+	definition, err := DeparseWithLongIdentifiers(&pgQuery.ParseResult{Stmts: []*pgQuery.RawStmt{definitionRawStmt}}, make(map[string]string))
 	if err != nil {
 		return fmt.Errorf("couldn't read definition of CREATE MATERIALIZED VIEW: %w", err)
 	}

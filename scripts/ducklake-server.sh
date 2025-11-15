@@ -27,7 +27,7 @@ load_env() {
 
         # Use port from .env.ducklake if set, otherwise use default
         export BEMIDB_PORT="${BEMIDB_PORT:-$SERVER_PORT}"
-        export BEMIDB_LOG_LEVEL="${BEMIDB_LOG_LEVEL:-DEBUG}"
+        export BEMIDB_LOG_LEVEL="${BEMIDB_LOG_LEVEL:-INFO}"
 
         # Update SERVER_PORT variable to match actual port being used
         SERVER_PORT=$BEMIDB_PORT
